@@ -1,16 +1,124 @@
 import sys
 import os
-import pickle
 import numpy as np
 import gymnasium as gym
-from tqdm import tqdm
 from datetime import datetime
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
+# Import CheckpointCallback and CallbackList
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
 
 # Add parent directory to path so imports work from any location
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from envs.decoder_env import DecoderEnv
-from agents.q_agent import DecoderAgent
+
+# We removed LoggingCallback as EpisodeStatsCallback handles everything now!
+
+def resume_training(checkpoint_path: str, env_setup, log_file: str, additional_timesteps: int):
+    """
+    Resumes training from a saved checkpoint model.
+    """
+    print(f"Loading model from checkpoint: {checkpoint_path}")
+    
+    model = PPO.load(checkpoint_path, env=env_setup, tensorboard_log="./logs/tensorboard")
+    
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    stats_callback = EpisodeStatsCallback(log_file)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=1_000_000, 
+        save_path=checkpoint_dir,
+        name_prefix="ppo_makespan_resumed"
+    )
+    callback_list = CallbackList([stats_callback, checkpoint_callback])
+    
+    print(f"Resuming training for {additional_timesteps} timesteps...")
+    
+    model.learn(
+        total_timesteps=additional_timesteps, 
+        callback=callback_list, 
+        reset_num_timesteps=False,
+        progress_bar=True
+    )
+    
+    final_save_path = checkpoint_path.replace(".zip", "_finished.zip")
+    model.save(final_save_path)
+    print(f"Resumed training complete! Saved to {final_save_path}")
+    
+    return model
+
+# ---------------------------------------------------------
+# ADVANCED TELEMETRY CALLBACK
+# ---------------------------------------------------------
+class EpisodeStatsCallback(BaseCallback):
+    def __init__(self, log_file):
+        super().__init__()
+        self.log_file = log_file
+        self.episode_count = 0
+        self.action_counts = np.zeros(8) # Track how often each decoder is picked
+        
+    def _init_callback(self):
+        with open(self.log_file, "w") as f:
+            f.write("step,episode_reward,episode_length,makespan\n")
+    
+    def _on_step(self):
+        # 1. Track which action the agent took in this exact step
+        action = self.locals["actions"][0]
+        self.action_counts[action] += 1
+
+        # 2. Log exploration stats continuously so TensorBoard has data immediately
+        if self.num_timesteps % 2048 == 0:
+            total_actions = np.sum(self.action_counts)
+            if total_actions > 0:
+                for i in range(8):
+                    pct = (self.action_counts[i] / total_actions) * 100
+                    self.logger.record(f"exploration/decoder_{i}_pct", pct)
+
+        # 3. Check if the episode is done
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if "episode" in info:
+                self.episode_count += 1
+                
+                # Extract data
+                episode_reward = info["episode"]["r"]
+                episode_length = info["episode"]["l"]
+                makespan = info.get("makespan", 0) 
+                # Grab the raw list of times we injected into DecoderEnv!
+                decoder_times = info.get("decoder_times", [0]*8) 
+                
+                # ==========================================
+                # TENSORBOARD LOGGING (End of Episode)
+                # ==========================================
+                # Log global makespan
+                self.logger.record("env/makespan", makespan)
+                
+                # Log individual final loads for all 8 decoders
+                for i, time_val in enumerate(decoder_times):
+                    self.logger.record(f"decoder_loads/decoder_{i}", time_val)
+                
+                # ==========================================
+                # CSV AND CONSOLE LOGGING
+                # ==========================================
+                with open(self.log_file, "a") as f:
+                    f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan}\n")
+                
+                # Print debug stats to console every 100 episodes
+                if self.episode_count % 100 == 0:
+                    print(f"\nStep {self.num_timesteps} | Episode {self.episode_count}")
+                    print(f"   Makespan: {makespan} | Reward: {episode_reward:.3f}")
+                    
+                    total_actions = np.sum(self.action_counts)
+                    # Format a neat string showing percentage of usage
+                    dist_str = " | ".join([f"D{i}:{int(pct)}%" for i, pct in enumerate((self.action_counts/total_actions)*100)])
+                    print(f"   Usage Spread: {dist_str}")
+                    print(f"   Final Loads:  {decoder_times}")
+                    
+                    # Reset action counts so we only see RECENT exploration behavior
+                    self.action_counts = np.zeros(8)
+                    
+        return True
 
 if __name__ == "__main__":
     # Create logs and models directories
@@ -20,88 +128,62 @@ if __name__ == "__main__":
     # Setup logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"logs/training_log_{timestamp}.txt"
-    model_file = f"models/agent_{timestamp}.pkl"
+    model_file = f"models/ppo_agent_{timestamp}"
+    checkpoint_dir = f"models/checkpoints_{timestamp}/"
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # hyperparameters should go here
-    learning_rate = 0.01        # How fast to learn (higher = faster but less stable)
-    n_episodes = 10000        # Number of hands to practice
-    start_epsilon = 1.0         # Start with 100% random actions
-    epsilon_decay = start_epsilon / (n_episodes / 2)  # Reduce exploration over time
-    final_epsilon = 0.1         # Always keep some exploration
-
-    # Initialize environment
-    env = DecoderEnv(width=200, height=200, comp_ratio=2)
-
-    # Initialize agent
-    agent = DecoderAgent(
+    # Hyperparameters for PPO
+    learning_rate = 3e-4          
+    n_steps = 16384                
+    batch_size = 512               
+    n_epochs = 10                 
+    gamma = 0.99                  
+    gae_lambda = 0.95             
+    clip_range = 0.2              
+    total_timesteps = 10_000_000      
+    
+    # Wrapped DecoderEnv in Monitor so info["episode"] is populated!
+    env = DummyVecEnv([lambda: Monitor(DecoderEnv(width=200, height=200, comp_ratio=2))])
+    
+    # Bring back VecNormalize ONLY for rewards to prevent gradient explosion!
+    # norm_obs=False ensures our manual observation scaling is untouched,
+    # meaning evaluate.py will continue to work perfectly without .pkl files.
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    
+    # Initialize PPO agent
+    model = PPO(
+        policy="MultiInputPolicy",  
         env=env,
         learning_rate=learning_rate,
-        initial_epsilon=start_epsilon,
-        epsilon_decay=epsilon_decay,
-        final_epsilon=final_epsilon,
-        discount_factor=0.99
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        clip_range=clip_range,
+        verbose=1,
+        tensorboard_log="./logs/tensorboard"
     )
 
-    # Training loop
-    print("Starting training...")
+    print("Starting PPO training...")
     print(f"Logging to: {log_file}")
-    print(f"Model will be saved to: {model_file}")
-    episode_rewards = []
-
-    # Write header to log file
-    with open(log_file, "w") as f:
-        f.write("episode,reward,makespan,epsilon\n")
-
-    for episode in range(n_episodes):
-        obs, info = env.reset()
-        state = agent.get_state(obs)
-        episode_reward = 0
-        
-        # Progress bar for packets in this episode
-        pbar = tqdm(total=env.num_packets, desc=f"Episode {episode + 1}", leave=False)
-        while True:
-            # Choose and perform action
-            action = agent.get_action(state)
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            next_state = agent.get_state(next_obs)
-
-            # Print decoder info
-            # print(f"Packet sent to decoder {action} | Decoder times: {env.decoder_time_left}")
-
-            # Update agent
-            agent.update_q_table(state, action, reward, next_state)
-
-            episode_reward += reward
-            state = next_state
-
-            # Update progress bar
-            pbar.update(1)
-            if terminated or truncated:
-                break
-
-        pbar.close()
-        
-        # Decay epsilon
-        agent.epsilon = max(final_epsilon, agent.epsilon - epsilon_decay)
-        episode_rewards.append(episode_reward)
-        
-        # Calculate makespan
-        makespan = max(env.decoder_time_left)
-        
-        # Log reward and makespan to file
-        with open(log_file, "a") as f:
-            f.write(f"{episode + 1},{episode_reward:.4f},{makespan},{agent.epsilon:.6f}\n")
-        
-        # Print progress every 1000 episodes
-        if (episode + 1) % 1000 == 0:
-            avg_reward = np.mean(episode_rewards[-1000:])
-            print(f"Episode {episode + 1}/{n_episodes} | Avg Reward: {avg_reward:.3f} | Makespan: {makespan} | Epsilon: {agent.epsilon:.3f}")
-            
-            # Save model every 1000 episodes
-            with open(model_file, "wb") as f:
-                pickle.dump(agent, f)
-            print(f"Model saved to {model_file}")
+    
+    # Initialize both callbacks
+    stats_callback = EpisodeStatsCallback(log_file)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=1_000_000, 
+        save_path=checkpoint_dir,
+        name_prefix="ppo_makespan"
+    )
+    callback_list = CallbackList([stats_callback, checkpoint_callback])
+    
+    # Train the model with the combined callback list
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=callback_list,
+        progress_bar=True
+    )
 
     print("Training complete!")
-    print(f"Final model saved to {model_file}")
-    print(f"Logs saved to {log_file}")
+    print(f"Final model saved to: {model_file}")
+    model.save(model_file)

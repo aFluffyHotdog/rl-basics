@@ -1,172 +1,118 @@
 import os
 import sys
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from stable_baselines3 import PPO
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from envs.decoder_env import DecoderEnv
 
-def plot_makespan_over_episodes(log_file=None):
+def denormalize_observation(obs, true_env):
     """
-    Plot the makespan over episodes from a training log file.
-    
-    Args:
-        log_file: Path to the log file. If None, uses the most recent log file.
+    Helper function to convert a normalized observation dictionary back into 
+    raw values for human debugging and logging, without breaking the model.
     """
-    # If no log file specified, find the most recent one
-    if log_file is None:
-        log_dir = Path("logs")
-        if not log_dir.exists():
-            print("No logs directory found. Run training first.")
-            return
-        
-        log_files = sorted(log_dir.glob("training_log_*.txt"))
-        if not log_files:
-            print("No log files found in logs directory.")
-            return
-        
-        log_file = log_files[-1]
-        print(f"Using log file: {log_file}")
+    # Recalculate the scaling factors used in the environment
+    max_possible_time = np.sum(true_env.packets) + 1.0
+    max_packet_cost = 20.0 # From your randint(1, 20)
     
-    # Read the CSV file
-    df = pd.read_csv(log_file)
-    
-    # Create figure and axis
-    plt.figure(figsize=(12, 6))
-    plt.plot(df['episode'], df['makespan'], linewidth=1, alpha=0.7)
-    plt.xlabel('Episode', fontsize=12)
-    plt.ylabel('Makespan (time units)', fontsize=12)
-    plt.title('Makespan Over Episodes', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    
-    # Add a rolling average line
-    window = 100
-    df['makespan_rolling_avg'] = df['makespan'].rolling(window=window, center=True).mean()
-    plt.plot(df['episode'], df['makespan_rolling_avg'], linewidth=2, 
-             label=f'{window}-episode rolling average', color='red')
-    
-    plt.legend(fontsize=10)
-    plt.tight_layout()
-    
-    # Save the plot
-    plot_file = log_file.parent / f"makespan_plot_{log_file.stem.split('_', 2)[2]}.png"
-    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {plot_file}")
-    
-    plt.show()
+    return {
+        "raw_decoder_time_left": np.round(obs["decoder_time_left"] * max_possible_time).astype(int),
+        "raw_next_cost": np.round(obs["next_cost"] * max_packet_cost).astype(int),
+        "raw_packets_remaining": np.round(obs["packets_remaining"] * true_env.num_packets).astype(int),
+    }
 
-
-def plot_reward_over_episodes(log_file=None):
+def evaluate_ppo_model(model_path=None, env_config=None):
     """
-    Plot the reward over episodes from a training log file.
-    
-    Args:
-        log_file: Path to the log file. If None, uses the most recent log file.
+    Load a PPO model and evaluate it on the DecoderEnv to get the final makespan.
     """
-    # If no log file specified, find the most recent one
-    if log_file is None:
-        log_dir = Path("logs")
-        if not log_dir.exists():
-            print("No logs directory found. Run training first.")
-            return
+    # Default environment config
+    if env_config is None:
+        env_config = {'width': 200, 'height': 200, 'comp_ratio': 2}
+    
+    # If no model path specified, find the most recent one
+    if model_path is None:
+        model_dir = Path("models")
+        if not model_dir.exists():
+            print("No models directory found. Train a model first.")
+            return None
         
-        log_files = sorted(log_dir.glob("training_log_*.txt"))
-        if not log_files:
-            print("No log files found in logs directory.")
-            return
+        model_files = sorted(model_dir.glob("ppo_agent_*.zip"))
+        # Filter out the 'resumed' or 'finished' if you want a specific one, 
+        # but [-1] grabs the latest chronologically if sorted by timestamp.
+        if not model_files:
+            print("No PPO model files found in models directory.")
+            return None
         
-        log_file = log_files[-1]
-        print(f"Using log file: {log_file}")
+        model_path = model_files[-1]
     
-    # Read the CSV file
-    df = pd.read_csv(log_file)
+    print(f"Loading PPO model from: {model_path}")
+    model = PPO.load(model_path)
     
-    # Create figure and axis
-    plt.figure(figsize=(12, 6))
-    plt.plot(df['episode'], df['reward'], linewidth=1, alpha=0.7)
-    plt.xlabel('Episode', fontsize=12)
-    plt.ylabel('Episode Reward', fontsize=12)
-    plt.title('Reward Over Episodes', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
+    # Create the raw environment (No DummyVecEnv or VecNormalize needed now!)
+    env = DecoderEnv(**env_config)
     
-    # Add a rolling average line
-    window = 100
-    df['reward_rolling_avg'] = df['reward'].rolling(window=window, center=True).mean()
-    plt.plot(df['episode'], df['reward_rolling_avg'], linewidth=2, 
-             label=f'{window}-episode rolling average', color='red')
+    # Run a single episode with the model
+    obs, info = env.reset()
+    done = False
+    step_count = 0
     
-    plt.legend(fontsize=10)
-    plt.tight_layout()
+    print("\n--- Starting Evaluation Episode ---")
     
-    # Save the plot
-    plot_file = log_file.parent / f"reward_plot_{log_file.stem.split('_', 2)[2]}.png"
-    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {plot_file}")
-    
-    plt.show()
+    while not done:
+        # 1. Model predicts using the NORMALIZED observation
+        action, _states = model.predict(obs, deterministic=True)
+        
+        # 2. Step the environment
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        step_count += 1
+        
+        # Optional: Print the first few steps to verify denormalization works
+        if step_count <= 3:
+            raw_obs = denormalize_observation(obs, env)
+            print(f"Step {step_count}: Model assigned packet to Decoder {action}.")
+            print(f"   Normalized State seen by model: {obs['decoder_time_left']}")
+            print(f"   Raw State evaluated by helper:  {raw_obs['raw_decoder_time_left']}")
 
-
-def plot_all_metrics(log_file=None):
-    """
-    Plot all metrics (makespan, reward, epsilon) in a single figure.
     
-    Args:
-        log_file: Path to the log file. If None, uses the most recent log file.
-    """
-    # If no log file specified, find the most recent one
-    if log_file is None:
-        log_dir = Path("logs")
-        if not log_dir.exists():
-            print("No logs directory found. Run training first.")
-            return
+    # Calculate final makespan directly from the underlying environment variables
+    ppo_makespan = max(env.decoder_time_left)
+    
+    # Calculate greedy baseline for comparison
+    env_greedy = DecoderEnv(**env_config)
+    # Re-using your environment's packets to ensure a fair comparison
+    env_greedy.packets = env.packets.copy() 
+    env_greedy.num_packets = env.num_packets
+    
+    greedy_done = False
+    greedy_obs, _ = env_greedy.reset()
+    while not greedy_done:
+        # Pure greedy heuristic: pick the decoder with the minimum time
+        best_action = np.argmin(env_greedy.decoder_time_left)
+        _, _, g_terminated, g_truncated, _ = env_greedy.step(best_action)
+        greedy_done = g_terminated or g_truncated
         
-        log_files = sorted(log_dir.glob("training_log_*.txt"))
-        if not log_files:
-            print("No log files found in logs directory.")
-            return
-        
-        log_file = log_files[-1]
-        print(f"Using log file: {log_file}")
+    greedy_makespan = max(env_greedy.decoder_time_left)
     
-    # Read the CSV file
-    df = pd.read_csv(log_file)
+    # Calculate performance ratio
+    ratio = ppo_makespan / greedy_makespan if greedy_makespan > 0 else float('inf')
     
-    # Create figure with 3 subplots
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    print(f"\n=== PPO Model Evaluation ===")
+    print(f"Model: {model_path}")
+    print(f"Steps taken: {step_count}")
+    print(f"PPO Makespan: {ppo_makespan}")
+    print(f"Greedy Makespan (Baseline): {greedy_makespan}")
+    print(f"Performance Ratio (PPO/Greedy): {ratio:.4f}")
+    print(f"PPO Final Decoder times: {env.decoder_time_left}")
+    print(f"Greedy Final Decoder times: {env_greedy.decoder_time_left}")
+    print(f"============================\n")
     
-    # Plot 1: Makespan
-    axes[0].plot(df['episode'], df['makespan'], linewidth=1, alpha=0.7, color='blue')
-    axes[0].set_ylabel('Makespan', fontsize=11)
-    axes[0].set_title('Training Metrics Over Episodes', fontsize=14, fontweight='bold')
-    axes[0].grid(True, alpha=0.3)
-    
-    # Plot 2: Reward
-    axes[1].plot(df['episode'], df['reward'], linewidth=1, alpha=0.7, color='green')
-    axes[1].set_ylabel('Reward', fontsize=11)
-    axes[1].grid(True, alpha=0.3)
-    
-    # Plot 3: Epsilon
-    axes[2].plot(df['episode'], df['epsilon'], linewidth=1, alpha=0.7, color='red')
-    axes[2].set_xlabel('Episode', fontsize=11)
-    axes[2].set_ylabel('Epsilon', fontsize=11)
-    axes[2].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    plot_file = log_file.parent / f"all_metrics_plot_{log_file.stem.split('_', 2)[2]}.png"
-    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {plot_file}")
-    
-    plt.show()
-
+    return ppo_makespan
 
 if __name__ == "__main__":
-    # Plot all available metrics
-    plot_all_metrics()
-    
-    # Or plot individual metrics:
-    # plot_makespan_over_episodes()
-    # plot_reward_over_episodes()
+    evaluate_ppo_model()
