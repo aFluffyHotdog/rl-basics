@@ -6,15 +6,30 @@ from datetime import datetime
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-# Import CheckpointCallback and CallbackList
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
 
 # Add parent directory to path so imports work from any location
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from envs.decoder_env import DecoderEnv
 
-# We removed LoggingCallback as EpisodeStatsCallback handles everything now!
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule.
+
+    :param initial_value: Initial learning rate.
+    :return: schedule that computes
+      current learning rate depending on remaining progress
+    """
+    def func(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0.
+
+        :param progress_remaining:
+        :return: current learning rate
+        """
+        return progress_remaining * initial_value
+
+    return func
 
 def resume_training(checkpoint_path: str, env_setup, log_file: str, additional_timesteps: int):
     """
@@ -133,14 +148,15 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Hyperparameters for PPO
-    learning_rate = 3e-4          
-    n_steps = 16384                
-    batch_size = 512               
+    learning_rate = linear_schedule(3e-4)         
+    n_steps = 4096                
+    batch_size = 128
+    ent_coef = 0.01               
     n_epochs = 10                 
     gamma = 0.99                  
     gae_lambda = 0.95             
     clip_range = 0.2              
-    total_timesteps = 10_000_000      
+    total_timesteps = 30_000_000      
     
     # Wrapped DecoderEnv in Monitor so info["episode"] is populated!
     env = DummyVecEnv([lambda: Monitor(DecoderEnv(width=200, height=200, comp_ratio=2))])
@@ -158,6 +174,7 @@ if __name__ == "__main__":
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
+        ent_coef=ent_coef,
         gamma=gamma,
         gae_lambda=gae_lambda,
         clip_range=clip_range,
