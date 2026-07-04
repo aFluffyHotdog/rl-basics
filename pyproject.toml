@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decoder-env"
+version = "0.1.0"
+description = "A Gymnasium environment package for the DecoderWorld reinforcement learning task."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["gymnasium", "reinforcement-learning", "rl", "environment"]
+authors = [
+  { name = "Your Name", email = "you@example.com" },
+]
+dependencies = [
+  "gymnasium>=0.28",
+  "numpy>=1.24",
+]
+
+[tool.setuptools]
+packages = ["decoder_env"]
+include-package-data = true
