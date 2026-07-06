@@ -16,3 +16,4 @@ ENV/
 .vscode/
 .DS_Store
 *.log
+sample_data/
