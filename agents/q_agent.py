@@ -1,6 +1,13 @@
 from collections import defaultdict
+from functools import partial
 import numpy as np
 import gymnasium as gym
+
+
+def _default_q_values(action_space_n):
+    """Factory function for defaultdict to create Q-value arrays."""
+    return np.zeros(action_space_n)
+
 
 class DecoderAgent:
     def __init__(
@@ -12,7 +19,7 @@ class DecoderAgent:
             final_epsilon: float, # min exploration rate
             discount_factor: float): # weight for future rewards
         self.env = env
-        self.q_table = defaultdict(lambda: np.zeros(env.action_space.n))
+        self.q_table = defaultdict(partial(_default_q_values, env.action_space.n))
         self.alpha = learning_rate
         self.gamma = discount_factor
         self.epsilon = initial_epsilon
