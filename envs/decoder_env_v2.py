@@ -14,14 +14,17 @@ from collections import deque
 from dataclasses import dataclass
 
 import gymnasium as gym
+import numpy as np
 
 LIT_FIFO_SIZE = 72 # 24/24/18/12
 CMD_FIFO_SIZE = 16
 BEATS_ON_BUS = 8
 NUM_DECODERS = 8
+LOOKAHEAD_WINDOW = 8
 CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
+MAX_CYCLES_LEFT = 16 # normalization constant for observation
 
 @dataclass
 class TokenInfo:
@@ -172,7 +175,33 @@ class DecoderEnvV2(gym.Env):
             
         self.num_cycles = 0
         self.action_space = gym.spaces.Discrete(NUM_DECODERS)
-        self.observation_space = {}
+        # We use a Dict space for readability, which RL wrappers like 
+        # SB3's MultiInputPolicy will automatically flatten for the neural network.
+        self.observation_space = gym.spaces.Dict({
+            # [8] Cycles left on current executing instruction (Normalized 0 to 1)
+            "cycles_left": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            
+            # [8] CMD FIFO Fill Level (Normalized 0 to 1)
+            "cmd_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            
+            # [8] LIT FIFO Fill Level (Normalized 0 to 1)
+            "lit_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            
+            # [8] 1 if waiting at barrier, 0 otherwise
+            "is_at_barrier": gym.spaces.MultiBinary(NUM_DECODERS),
+            
+            # [8] 1 if completely finished, 0 otherwise
+            "is_done": gym.spaces.MultiBinary(NUM_DECODERS),
+
+            # [8] 1 if head of CMD_FIFO is starved for literals, 0 otherwise
+            "is_lit_starved": gym.spaces.MultiBinary(NUM_DECODERS),
+            
+            # [8, 8] Lookahead Types: 0=CMD, 1=LIT, 2=RLE, 3=SEED, -1=EMPTY/PAD
+            "lookahead_types": gym.spaces.Box(low=-1, high=3, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.int32),
+            
+            # [8, 8] Lookahead Cycles: (Normalized 0 to 1), 0 for EMPTY/PAD
+            "lookahead_cycles": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
+        })
 
     def _load_hex_folder(self, cmd_path: str) -> list:
         path = Path(cmd_path)
@@ -266,3 +295,44 @@ class DecoderEnvV2(gym.Env):
             terminated = True
 
         return observation, reward, terminated, truncated, info
+    
+    def _get_obs(self):
+        obs = {
+            "cycles_left": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "cmd_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "lit_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "is_at_barrier": np.zeros(NUM_DECODERS, dtype=np.int8),
+            "is_done": np.zeros(NUM_DECODERS, dtype=np.int8),
+            "is_lit_starved": np.zeros(NUM_DECODERS, dtype=np.int8),
+            "lookahead_types": np.full((NUM_DECODERS, 8), -1, dtype=np.int32), # Pad with -1
+            "lookahead_cycles": np.zeros((NUM_DECODERS, 8), dtype=np.float32)
+        }
+        
+        type_mapping = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}
+
+        for i, sub_d in enumerate(self.decoders):
+            # 1. Fill basic status & normalize
+            obs["cycles_left"][i] = min(sub_d.cycles_left / MAX_CYCLES_LEFT, 1.0) 
+            obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
+            obs["lit_fifo_fill"][i] = len(sub_d.LIT_FIFO) / LIT_FIFO_SIZE
+            obs["is_at_barrier"][i] = int(sub_d.is_waiting_at_barrier)
+            obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0)
+
+            # 2. Check Literal Starvation
+            if len(sub_d.CMD_FIFO) > 0:
+                head_tok = sub_d.CMD_FIFO[0]
+                if head_tok.category == "CMD" and len(sub_d.LIT_FIFO) < head_tok.req_lit_chunks:
+                    obs["is_lit_starved"][i] = 1
+
+            # 3. Populate Lookahead Buffer
+            bus_queue = self.cmds[i]
+            window_size = min(len(bus_queue), 8)
+            
+            for j in range(window_size):
+                raw_token = bus_queue[j]
+                token_info = sub_d.decode_token(raw_token) # Peek and decode
+                
+                obs["lookahead_types"][i, j] = type_mapping.get(token_info.category, -1)
+                obs["lookahead_cycles"][i, j] = min(token_info.cycles / MAX_CYCLES_LEFT, 1.0)
+                
+        return obs
