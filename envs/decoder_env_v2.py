@@ -7,7 +7,8 @@ now implements:
     - FIFO buffer behavior
     - cycle modelling based on CMD type and size
     - Clean pipeline architecture (Decode -> Route -> Execute)
-    - Global row barrier synchronization
+    - 4-Row Output Buffer with Dynamic Backpressure
+    - Throughput & Deadzone Imbalance Reward Shaping
 """
 from pathlib import Path
 from collections import deque
@@ -21,6 +22,8 @@ CMD_FIFO_SIZE = 16
 BEATS_ON_BUS = 8
 NUM_DECODERS = 8
 LOOKAHEAD_WINDOW = 8
+OUTPUT_ROW_BUFFER_SIZE = 4 # How many rows ahead a subdecoder can get before stalling
+
 CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
@@ -43,11 +46,12 @@ class SubDecoder():
         self.LIT_FIFO = deque(maxlen=LIT_FIFO_SIZE)
         # 16 chunk CMD FIFO buffer
         self.CMD_FIFO = deque(maxlen=CMD_FIFO_SIZE)
+        # 4-row output FIFO
+        self.OUTPUT_FIFO = deque(maxlen=OUTPUT_ROW_BUFFER_SIZE)
         
         # Execution State
         self.cycles_left = 0
         self.active_cycles = 0
-        self.is_waiting_at_barrier = False
 
     def debug_dump_buffers(self):
         cmd_types = [tok.category for tok in self.CMD_FIFO]
@@ -55,6 +59,7 @@ class SubDecoder():
         return (
             f"CMD_FIFO_count={len(self.CMD_FIFO)}, CMD_FIFO_types={cmd_types}, "
             f"LIT_FIFO_count={len(self.LIT_FIFO)}, LIT_preview={lit_preview}, "
+            f"OUTPUT_FIFO_count={len(self.OUTPUT_FIFO)}, "
             f"cycles_left={self.cycles_left}"
         )
 
@@ -108,9 +113,7 @@ class SubDecoder():
     
     def can_accept(self, token_info: TokenInfo) -> bool:
         """Evaluates if the appropriate FIFO has space for the decoded token."""
-        if self.is_waiting_at_barrier:
-            return False
-            
+        # The bus only cares if the input FIFOs are full. Output stalls happen downstream.
         if token_info.category == "LIT":
             return len(self.LIT_FIFO) < self.LIT_FIFO.maxlen
         else:
@@ -130,10 +133,6 @@ class SubDecoder():
             self.cycles_left -= 1
             self.active_cycles += 1
             return
-            
-        # Halt at barrier
-        if self.is_waiting_at_barrier:
-            return
 
         # Attempt to start new task
         if self.cycles_left == 0 and self.CMD_FIFO:
@@ -146,11 +145,14 @@ class SubDecoder():
             if next_tok.category == "CMD" and len(self.LIT_FIFO) < next_tok.req_lit_chunks:
                 return # Stall waiting for bus to deliver literals
                 
+            if next_tok.is_barrier and len(self.OUTPUT_FIFO) == self.OUTPUT_FIFO.maxlen:
+                return # Stall waiting for the output buffer to drain
+                
             # Safe Execution
             executed_tok = self.CMD_FIFO.popleft()
             
             if executed_tok.is_barrier:
-                self.is_waiting_at_barrier = True
+                self.OUTPUT_FIFO.append(1) # Push a completed row into the buffer
                 self.cycles_left = executed_tok.cycles
                 self.active_cycles += 1
                 return
@@ -168,6 +170,7 @@ class SubDecoder():
 class DecoderEnvV2(gym.Env):
     def __init__(self, cmd_path: str):
         self.cmds = self._load_hex_folder(cmd_path)
+        self._initial_cmds = [deque(list(queue)) for queue in self.cmds]
         
         self.decoders = []
         for i in range(NUM_DECODERS):
@@ -175,31 +178,15 @@ class DecoderEnvV2(gym.Env):
             
         self.num_cycles = 0
         self.action_space = gym.spaces.Discrete(NUM_DECODERS)
-        # We use a Dict space for readability, which RL wrappers like 
-        # SB3's MultiInputPolicy will automatically flatten for the neural network.
+        
         self.observation_space = gym.spaces.Dict({
-            # [8] Cycles left on current executing instruction (Normalized 0 to 1)
             "cycles_left": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
-            
-            # [8] CMD FIFO Fill Level (Normalized 0 to 1)
             "cmd_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
-            
-            # [8] LIT FIFO Fill Level (Normalized 0 to 1)
             "lit_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
-            
-            # [8] 1 if waiting at barrier, 0 otherwise
-            "is_at_barrier": gym.spaces.MultiBinary(NUM_DECODERS),
-            
-            # [8] 1 if completely finished, 0 otherwise
+            "is_stalled_by_output": gym.spaces.MultiBinary(NUM_DECODERS),
             "is_done": gym.spaces.MultiBinary(NUM_DECODERS),
-
-            # [8] 1 if head of CMD_FIFO is starved for literals, 0 otherwise
             "is_lit_starved": gym.spaces.MultiBinary(NUM_DECODERS),
-            
-            # [8, 8] Lookahead Types: 0=CMD, 1=LIT, 2=RLE, 3=SEED, -1=EMPTY/PAD
             "lookahead_types": gym.spaces.Box(low=-1, high=3, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.int32),
-            
-            # [8, 8] Lookahead Cycles: (Normalized 0 to 1), 0 for EMPTY/PAD
             "lookahead_cycles": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
         })
 
@@ -248,8 +235,9 @@ class DecoderEnvV2(gym.Env):
 
         target_sub_d = action
         self.num_cycles += 1
+        tokens_pushed = 0
 
-        # Bus Transfer Phase 
+        # Bus Transfer Phase
         if self.cmds[target_sub_d]:
             i = 0
             while i < BEATS_ON_BUS and self.cmds[target_sub_d]:
@@ -263,45 +251,76 @@ class DecoderEnvV2(gym.Env):
                     self.cmds[target_sub_d].popleft()
                     subdecoder.receive_token(token_info)
                     i += 1
+                    tokens_pushed += 1
                 else: 
-                    # Hardware block (FIFO Full or Barrier). Yield the bus.
+                    # Hardware block (FIFO Full or Output Buffer Full). Yield the bus.
                     break 
 
         # --- Execution Phase ---
         self.step_sub_decoders()
 
-        # --- Barrier Synchronization Phase ---
-        all_at_barrier = True
+        # --- Dynamic Output Buffer Synchronization Phase ---
+        # Hardware row buffers drain when all active subdecoders have pushed 
+        # at least one completed row into their output FIFOs.
+        active_decoders = []
         for idx, sub_d in enumerate(self.decoders):
-            is_waiting = getattr(sub_d, 'is_waiting_at_barrier', False)
-            
-            # A subdecoder is only truly done if the main bitstream is ALSO empty
+            # A subdecoder is truly finished only if its output is also completely flushed
             is_permanently_finished = (
                 len(self.cmds[idx]) == 0 and 
                 len(sub_d.CMD_FIFO) == 0 and 
-                sub_d.cycles_left == 0
+                sub_d.cycles_left == 0 and
+                len(sub_d.OUTPUT_FIFO) == 0
             )
-            
-            if not (is_waiting or is_permanently_finished):
-                all_at_barrier = False
-                break
-                
-        if all_at_barrier:
-            for sub_d in self.decoders:
-                sub_d.is_waiting_at_barrier = False
+            if not is_permanently_finished:
+                active_decoders.append(sub_d)
         
-        # --- Termination Phase ---
-        if all(len(q) == 0 for q in self.cmds) and all(sub_d.cycles_left == 0 for sub_d in self.decoders):
-            terminated = True
+        # Flush 1 row from all active decoders if they all have at least 1 completed row ready
+        if active_decoders and all(len(sub_d.OUTPUT_FIFO) > 0 for sub_d in active_decoders):
+            for sub_d in active_decoders:
+                sub_d.OUTPUT_FIFO.popleft()
 
+        # --- Reward Shaping Phase ---
+        # 1. Throughput calculation (+1.0 per token moved, -1.0 per cycle)
+        # 2. Deadzone Imbalance penalty (Safe margin = 2 rows. Exceeding costs points.)
+        row_counts = [len(sub_d.OUTPUT_FIFO) for sub_d in self.decoders]
+        row_spread = max(row_counts) - min(row_counts)
+        
+        SAFE_MARGIN = 2
+        imbalance_penalty = 0.0
+        if row_spread > SAFE_MARGIN:
+            excess_spread = row_spread - SAFE_MARGIN
+            imbalance_penalty = (excess_spread ** 2) * 0.5
+            
+        reward = (tokens_pushed * 1.0) - imbalance_penalty - 1.0
+        
+        # Terminate once we're out of CMDs and all subdecoders are done
+        if all(len(q) == 0 for q in self.cmds) and all(sub_d.cycles_left == 0 for sub_d in self.decoders) and all(len(sub_d.OUTPUT_FIFO) == 0 for sub_d in self.decoders):
+            terminated = True
+            
+            # Pass final diagnostic metrics to the PPO Monitor callback
+            info["makespan"] = self.num_cycles
+            info["decoder_times"] = [sub_d.active_cycles for sub_d in self.decoders]
+
+        observation = self._get_obs()
         return observation, reward, terminated, truncated, info
     
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.cmds = [deque(list(queue)) for queue in self._initial_cmds]
+        self.decoders = [SubDecoder() for _ in range(NUM_DECODERS)]
+        self.num_cycles = 0
+
+        observation = self._get_obs()
+        info = {}
+        return observation, info
+
     def _get_obs(self):
         obs = {
             "cycles_left": np.zeros(NUM_DECODERS, dtype=np.float32),
             "cmd_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
             "lit_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
-            "is_at_barrier": np.zeros(NUM_DECODERS, dtype=np.int8),
+            "is_stalled_by_output": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_done": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_lit_starved": np.zeros(NUM_DECODERS, dtype=np.int8),
             "lookahead_types": np.full((NUM_DECODERS, 8), -1, dtype=np.int32), # Pad with -1
@@ -315,8 +334,8 @@ class DecoderEnvV2(gym.Env):
             obs["cycles_left"][i] = min(sub_d.cycles_left / MAX_CYCLES_LEFT, 1.0) 
             obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
             obs["lit_fifo_fill"][i] = len(sub_d.LIT_FIFO) / LIT_FIFO_SIZE
-            obs["is_at_barrier"][i] = int(sub_d.is_waiting_at_barrier)
-            obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0)
+            obs["is_stalled_by_output"][i] = int(len(sub_d.OUTPUT_FIFO) == sub_d.OUTPUT_FIFO.maxlen)
+            obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0 and len(sub_d.OUTPUT_FIFO) == 0)
 
             # 2. Check Literal Starvation
             if len(sub_d.CMD_FIFO) > 0:

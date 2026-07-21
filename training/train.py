@@ -1,7 +1,9 @@
 import sys
 import os
+import argparse
 import numpy as np
 import gymnasium as gym
+from typing import Callable
 from datetime import datetime
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -10,7 +12,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback,
 
 # Add parent directory to path so imports work from any location
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from envs.decoder_env import DecoderEnv
+from envs.decoder_env_v2 import DecoderEnvV2, NUM_DECODERS
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
     """
@@ -71,7 +73,7 @@ class EpisodeStatsCallback(BaseCallback):
         super().__init__()
         self.log_file = log_file
         self.episode_count = 0
-        self.action_counts = np.zeros(8) # Track how often each decoder is picked
+        self.action_counts = np.zeros(NUM_DECODERS) # Track how often each decoder is picked
         
     def _init_callback(self):
         with open(self.log_file, "w") as f:
@@ -86,7 +88,7 @@ class EpisodeStatsCallback(BaseCallback):
         if self.num_timesteps % 2048 == 0:
             total_actions = np.sum(self.action_counts)
             if total_actions > 0:
-                for i in range(8):
+                for i in range(NUM_DECODERS):
                     pct = (self.action_counts[i] / total_actions) * 100
                     self.logger.record(f"exploration/decoder_{i}_pct", pct)
 
@@ -99,9 +101,9 @@ class EpisodeStatsCallback(BaseCallback):
                 # Extract data
                 episode_reward = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
-                makespan = info.get("makespan", 0) 
-                # Grab the raw list of times we injected into DecoderEnv!
-                decoder_times = info.get("decoder_times", [0]*8) 
+                
+                makespan = episode_length
+                decoder_times = info.get("decoder_times", [0] * NUM_DECODERS) 
                 
                 # ==========================================
                 # TENSORBOARD LOGGING (End of Episode)
@@ -131,11 +133,17 @@ class EpisodeStatsCallback(BaseCallback):
                     print(f"   Final Loads:  {decoder_times}")
                     
                     # Reset action counts so we only see RECENT exploration behavior
-                    self.action_counts = np.zeros(8)
+                    self.action_counts = np.zeros(NUM_DECODERS)
                     
         return True
 
 if __name__ == "__main__":
+    # Add argparse to allow running with different datasets from the command line
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--cmd_path', type=str, default='sample_data/test_11_lantern/beats_hex',
+                    help="Path to the hex folder dataset for the environment.")
+    args = ap.parse_args()
+
     # Create logs and models directories
     os.makedirs("logs", exist_ok=True)
     os.makedirs("models", exist_ok=True)
@@ -158,12 +166,11 @@ if __name__ == "__main__":
     clip_range = 0.2              
     total_timesteps = 30_000_000      
     
-    # Wrapped DecoderEnv in Monitor so info["episode"] is populated!
-    env = DummyVecEnv([lambda: Monitor(DecoderEnv(width=200, height=200, comp_ratio=2))])
+    # Wrapped DecoderEnvV2 in Monitor
+    # Swapped initialization parameters to use the hex path
+    env = DummyVecEnv([lambda: Monitor(DecoderEnvV2(cmd_path=args.cmd_path))])
     
     # Bring back VecNormalize ONLY for rewards to prevent gradient explosion!
-    # norm_obs=False ensures our manual observation scaling is untouched,
-    # meaning evaluate.py will continue to work perfectly without .pkl files.
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
     
     # Initialize PPO agent
@@ -182,7 +189,7 @@ if __name__ == "__main__":
         tensorboard_log="./logs/tensorboard"
     )
 
-    print("Starting PPO training...")
+    print(f"Starting PPO training on dataset: {args.cmd_path}")
     print(f"Logging to: {log_file}")
     
     # Initialize both callbacks
