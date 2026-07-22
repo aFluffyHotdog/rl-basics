@@ -10,13 +10,11 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.decoder_env_v2 import DecoderEnvV2, NUM_DECODERS
 
-def evaluate_agent(model_path: str, cmd_path: str, output_schedule_path: str):
-    print(f"Loading environment with dataset from folder: {cmd_path}")
+def evaluate_agent(model_path: str, data_dir: str, output_schedule_path: str):
+    print(f"Loading environment with dataset from folder: {data_dir}")
     
-    # We wrap the env in DummyVecEnv so the Dict observation space is correctly
-    # batched (shape 1, ...) for Stable-Baselines3's predict method.
-    # Note: We do NOT need VecNormalize here because norm_obs was False during training!
-    raw_env = DecoderEnvV2(cmd_path=cmd_path)
+    # We pass is_eval=True so the environment loads the held-out validation images!
+    raw_env = DecoderEnvV2(data_dir=data_dir, train_split_pct=0.8, is_eval=True)
     env = DummyVecEnv([lambda: raw_env])
     
     print(f"Loading trained model from: {model_path}")
@@ -114,11 +112,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a trained PPO agent on DecoderEnvV2.")
     parser.add_argument("--model_path", type=str, required=True,
                         help="Path to the trained .zip model file.")
-    parser.add_argument("--cmd_path", type=str, default="sample_data/test_11_lantern/beats_hex",
-                        help="Path to the folder containing the hex cmds.")
+    parser.add_argument("--data_dir", type=str, default="sample_data",
+                        help="Path to the top-level folder containing test images.")
     parser.add_argument("--output", type=str, default="generated_schedule.txt",
                         help="Path to save the generated static schedule text file.")
     
     args = parser.parse_args()
     
-    evaluate_agent(args.model_path, args.cmd_path, args.output)
+    evaluate_agent(args.model_path, args.data_dir, args.output)

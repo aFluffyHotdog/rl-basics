@@ -140,8 +140,8 @@ class EpisodeStatsCallback(BaseCallback):
 if __name__ == "__main__":
     # Add argparse to allow running with different datasets from the command line
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cmd_path', type=str, default='sample_data/test_11_lantern/beats_hex',
-                    help="Path to the hex folder dataset for the environment.")
+    ap.add_argument('--data_dir', type=str, default='sample_data',
+                    help="Path to the top level folder containing the dataset")
     args = ap.parse_args()
 
     # Create logs and models directories
@@ -164,11 +164,10 @@ if __name__ == "__main__":
     gamma = 0.99                  
     gae_lambda = 0.95             
     clip_range = 0.2              
-    total_timesteps = 30_000_000      
+    total_timesteps = 30_000_000 
     
     # Wrapped DecoderEnvV2 in Monitor
-    # Swapped initialization parameters to use the hex path
-    env = DummyVecEnv([lambda: Monitor(DecoderEnvV2(cmd_path=args.cmd_path))])
+    env = DummyVecEnv([lambda: Monitor(DecoderEnvV2(data_dir=args.data_dir, train_split_pct=0.8, is_eval=False))])
     
     # Bring back VecNormalize ONLY for rewards to prevent gradient explosion!
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
@@ -189,7 +188,7 @@ if __name__ == "__main__":
         tensorboard_log="./logs/tensorboard"
     )
 
-    print(f"Starting PPO training on dataset: {args.cmd_path}")
+    print(f"Starting PPO training on dataset: {args.data_dir}")
     print(f"Logging to: {log_file}")
     
     # Initialize both callbacks

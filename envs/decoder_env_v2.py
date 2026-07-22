@@ -13,6 +13,7 @@ now implements:
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
+import random
 
 import gymnasium as gym
 import numpy as np
@@ -28,6 +29,7 @@ CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
 MAX_CYCLES_LEFT = 16 # normalization constant for observation
+DEADLOCK_THRESHOLD = 500
 
 @dataclass
 class TokenInfo:
@@ -168,15 +170,50 @@ class SubDecoder():
 
 
 class DecoderEnvV2(gym.Env):
-    def __init__(self, cmd_path: str):
-        self.cmds = self._load_hex_folder(cmd_path)
-        self._initial_cmds = [deque(list(queue)) for queue in self.cmds]
+    def __init__(self, data_dir: str, train_split_pct: float = 0.8, is_eval: bool = False, seed: int = 42):
+        self.data_dir = Path(data_dir)
+        if not self.data_dir.is_dir():
+            raise ValueError(f"data_dir must be a directory: {data_dir}")
+            
+        # Discover all subfolders that contain a 'beats_hex' folder
+        all_datasets = []
+        for test_folder in sorted(self.data_dir.iterdir()):
+            if test_folder.is_dir():
+                hex_dir = test_folder / "beats_hex"
+                if hex_dir.exists() and hex_dir.is_dir():
+                    try:
+                        cmds = self._load_hex_folder(hex_dir)
+                        all_datasets.append(cmds)
+                    except Exception as e:
+                        print(f"Skipping {test_folder.name} due to error: {e}")
+                        
+        if not all_datasets:
+            raise ValueError(f"No valid datasets found in {data_dir}")
+            
+        # Deterministically shuffle to create consistent train/eval splits
+        rng = random.Random(seed)
+        rng.shuffle(all_datasets)
+        
+        # Split datasets
+        split_idx = max(1, int(len(all_datasets) * train_split_pct))
+        
+        if is_eval:
+            self.dataset_pool = all_datasets[split_idx:]
+            # Fallback if split leaves eval empty
+            if not self.dataset_pool:
+                print("Warning: train_split_pct too high, using all datasets for eval.")
+                self.dataset_pool = all_datasets
+        else:
+            self.dataset_pool = all_datasets[:split_idx]
+            
+        print(f"Loaded {len(self.dataset_pool)} datasets for {'evaluation' if is_eval else 'training'}.")
         
         self.decoders = []
         for i in range(NUM_DECODERS):
             self.decoders.append(SubDecoder())
             
         self.num_cycles = 0
+        self.stall_cycles = 0
         self.action_space = gym.spaces.Discrete(NUM_DECODERS)
         
         self.observation_space = gym.spaces.Dict({
@@ -237,7 +274,7 @@ class DecoderEnvV2(gym.Env):
         self.num_cycles += 1
         tokens_pushed = 0
 
-        # Bus Transfer Phase
+        # --- Bus Transfer Phase ---
         if self.cmds[target_sub_d]:
             i = 0
             while i < BEATS_ON_BUS and self.cmds[target_sub_d]:
@@ -255,6 +292,20 @@ class DecoderEnvV2(gym.Env):
                 else: 
                     # Hardware block (FIFO Full or Output Buffer Full). Yield the bus.
                     break 
+
+        # Track stalls: if the bus pushed nothing but there is still work to do
+        if tokens_pushed == 0 and any(len(q) > 0 for q in self.cmds):
+            self.stall_cycles += 1
+        else:
+            self.stall_cycles = 0
+
+        # --- Deadlock Detection & Penalty ---
+        if self.stall_cycles > DEADLOCK_THRESHOLD:
+            terminated = True
+            reward -= 50000.0 
+            info["deadlock"] = True
+            observation = self._get_obs()
+            return observation, reward, terminated, truncated, info
 
         # --- Execution Phase ---
         self.step_sub_decoders()
@@ -293,7 +344,7 @@ class DecoderEnvV2(gym.Env):
             
         reward = (tokens_pushed * 1.0) - imbalance_penalty - 1.0
         
-        # Terminate once we're out of CMDs and all subdecoders are done
+        # --- Termination Phase ---
         if all(len(q) == 0 for q in self.cmds) and all(sub_d.cycles_left == 0 for sub_d in self.decoders) and all(len(sub_d.OUTPUT_FIFO) == 0 for sub_d in self.decoders):
             terminated = True
             
@@ -307,9 +358,14 @@ class DecoderEnvV2(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.cmds = [deque(list(queue)) for queue in self._initial_cmds]
+        # Randomly select one dataset from the pool for this episode
+        selected_idx = self.np_random.integers(0, len(self.dataset_pool))
+        selected_dataset = self.dataset_pool[selected_idx]
+
+        self.cmds = [deque(list(queue)) for queue in selected_dataset]
         self.decoders = [SubDecoder() for _ in range(NUM_DECODERS)]
         self.num_cycles = 0
+        self.stall_cycles = 0
 
         observation = self._get_obs()
         info = {}
