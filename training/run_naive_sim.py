@@ -15,7 +15,7 @@ from envs.decoder_env_v2 import DecoderEnvV2, NUM_DECODERS
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd_path', nargs='?', default='sample_data/test_11_lantern/beats_hex')
+    ap.add_argument('--cmd_path', nargs='?', default='sample_data/test_11_lantern/beats_hex')
     args = ap.parse_args()
 
     cmd_path = Path(args.cmd_path)
