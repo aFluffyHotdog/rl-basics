@@ -1,6 +1,8 @@
 absl-py==2.4.0
 annotated-types==0.7.0
 asarPy==1.0.1
+certifi==2026.7.22
+charset-normalizer==3.4.9
 cloudpickle==3.1.2
 colorama==0.4.6
 contourpy==1.3.3
@@ -9,6 +11,7 @@ cuda-bindings==13.3.1
 cuda-pathfinder==1.5.5
 cuda-toolkit==13.0.2
 cycler==0.12.1
+docopt==0.6.2
 dunamai==1.26.1
 Farama-Notifications==0.0.6
 filelock==3.29.4
@@ -17,6 +20,7 @@ fsspec==2026.4.0
 funcy==2.0
 grpcio==1.81.1
 gymnasium==1.2.3
+idna==3.18
 Jinja2==3.1.6
 jinja2-ansible-filters==1.3.2
 kiwisolver==1.5.0
@@ -58,10 +62,12 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 questionary==2.1.1
+requests==2.34.2
 rich==15.0.0
+sb3_contrib==2.9.0
 setuptools==81.0.0
 six==1.17.0
-stable_baselines3==2.8.0
+stable_baselines3==2.9.0
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
@@ -70,5 +76,7 @@ tqdm==4.68.2
 triton==3.7.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
+urllib3==2.7.0
 wcwidth==0.8.1
 Werkzeug==3.1.8
+yarg==0.1.10
