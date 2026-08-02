@@ -22,7 +22,7 @@ LIT_FIFO_SIZE = 72 # 24/24/18/12
 CMD_FIFO_SIZE = 16
 BEATS_ON_BUS = 8
 NUM_DECODERS = 8
-LOOKAHEAD_WINDOW = 8
+LOOKAHEAD_WINDOW = 128
 OUTPUT_ROW_BUFFER_SIZE = 4 # How many rows ahead a subdecoder can get before stalling
 
 CMD_TYPE=0
@@ -258,6 +258,32 @@ class DecoderEnvV2(gym.Env):
             outputs.append(parsed)
 
         return outputs
+
+    def action_masks(self):
+        """
+        Dynamically calculates which actions (subdecoders) are legal to pick right now.
+        Returns a boolean array of length NUM_DECODERS (1 = legal, 0 = illegal).
+        """
+        masks = np.zeros(NUM_DECODERS, dtype=np.int8)
+        for i, sub_d in enumerate(self.decoders):
+            # If there are no commands left to send on this bus lane, it's an illegal action
+            if not self.cmds[i]:
+                continue
+                
+            # Peek at the next token to be transferred
+            raw_cmd = self.cmds[i][0]
+            token_info = sub_d.decode_token(raw_cmd)
+            
+            # Action is only legal if the target FIFO actually has space for it
+            if sub_d.can_accept(token_info):
+                masks[i] = 1
+                
+        # Fallback: If ALL paths are physically blocked, we must return at least one '1' 
+        # to prevent SB3 from crashing. The env will catch the stall and terminate anyway.
+        if not masks.any():
+            masks.fill(1)
+            
+        return masks
     
     def step_sub_decoders(self):
         for sub_d in self.decoders:
@@ -296,13 +322,19 @@ class DecoderEnvV2(gym.Env):
         # Track stalls: if the bus pushed nothing but there is still work to do
         if tokens_pushed == 0 and any(len(q) > 0 for q in self.cmds):
             self.stall_cycles += 1
+            reward -= 5.0
         else:
             self.stall_cycles = 0
 
         # --- Deadlock Detection & Penalty ---
         if self.stall_cycles > DEADLOCK_THRESHOLD:
             terminated = True
-            reward -= 50000.0 
+            # Count exactly how much work the agent failed to finish
+            remaining_tokens = sum(len(q) for q in self.cmds)
+            
+            # Make the penalty mathematically worse than taking 10 cycles per remaining token
+            dynamic_penalty = (remaining_tokens * 10.0) + 50000.0
+            reward -= dynamic_penalty
             info["deadlock"] = True
             observation = self._get_obs()
             return observation, reward, terminated, truncated, info
@@ -329,6 +361,7 @@ class DecoderEnvV2(gym.Env):
         if active_decoders and all(len(sub_d.OUTPUT_FIFO) > 0 for sub_d in active_decoders):
             for sub_d in active_decoders:
                 sub_d.OUTPUT_FIFO.popleft()
+            reward += 20.0 
 
         # --- Reward Shaping Phase ---
         # 1. Throughput calculation (+1.0 per token moved, -1.0 per cycle)
@@ -379,8 +412,8 @@ class DecoderEnvV2(gym.Env):
             "is_stalled_by_output": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_done": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_lit_starved": np.zeros(NUM_DECODERS, dtype=np.int8),
-            "lookahead_types": np.full((NUM_DECODERS, 8), -1, dtype=np.int32), # Pad with -1
-            "lookahead_cycles": np.zeros((NUM_DECODERS, 8), dtype=np.float32)
+            "lookahead_types": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.int32), # Pad with -1
+            "lookahead_cycles": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32)
         }
         
         type_mapping = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}
@@ -401,7 +434,7 @@ class DecoderEnvV2(gym.Env):
 
             # 3. Populate Lookahead Buffer
             bus_queue = self.cmds[i]
-            window_size = min(len(bus_queue), 8)
+            window_size = min(LOOKAHEAD_WINDOW, len(bus_queue))
             
             for j in range(window_size):
                 raw_token = bus_queue[j]
