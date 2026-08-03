@@ -9,6 +9,7 @@ now implements:
     - Clean pipeline architecture (Decode -> Route -> Execute)
     - 4-Row Output Buffer with Dynamic Backpressure
     - Throughput & Deadzone Imbalance Reward Shaping
+    - Action Masking & Multi-Dataset support
 """
 from pathlib import Path
 from collections import deque
@@ -21,15 +22,14 @@ import numpy as np
 LIT_FIFO_SIZE = 72 # 24/24/18/12
 CMD_FIFO_SIZE = 16
 BEATS_ON_BUS = 8
-NUM_DECODERS = 8
-LOOKAHEAD_WINDOW = 128
+NUM_DECODERS = 9
+LOOKAHEAD_WINDOW = 128 # Deep lookahead for Action Masking / PPO planning
 OUTPUT_ROW_BUFFER_SIZE = 4 # How many rows ahead a subdecoder can get before stalling
 
 CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
 MAX_CYCLES_LEFT = 16 # normalization constant for observation
-DEADLOCK_THRESHOLD = 500
 
 @dataclass
 class TokenInfo:
@@ -42,7 +42,7 @@ class TokenInfo:
     cycles: int          # Pre-calculated execution time
 
 class SubDecoder():
-    def __init__(self):
+    def __init__(self, is_bypass=False):
         # NOTE: 1 chunk = 16 bit
         # 24/24/18/12 * 4 chunk LIT FIFO buffers
         self.LIT_FIFO = deque(maxlen=LIT_FIFO_SIZE)
@@ -54,31 +54,17 @@ class SubDecoder():
         # Execution State
         self.cycles_left = 0
         self.active_cycles = 0
-
-    def debug_dump_buffers(self):
-        cmd_types = [tok.category for tok in self.CMD_FIFO]
-        lit_preview = [tok.raw_val & 0xFFFF for tok in list(self.LIT_FIFO)[:8]]
-        return (
-            f"CMD_FIFO_count={len(self.CMD_FIFO)}, CMD_FIFO_types={cmd_types}, "
-            f"LIT_FIFO_count={len(self.LIT_FIFO)}, LIT_preview={lit_preview}, "
-            f"OUTPUT_FIFO_count={len(self.OUTPUT_FIFO)}, "
-            f"cycles_left={self.cycles_left}"
-        )
-
-    def debug_dump_state(self):
-        state = {}
-        for name, value in self.__dict__.items():
-            if isinstance(value, deque):
-                state[name] = {
-                    "count": len(value),
-                    "items": [t.raw_val for t in value],
-                    "maxlen": value.maxlen,
-                }
-            else:
-                state[name] = value
-        return state
+        self.is_lit_starved = False
+        self.is_bypass = is_bypass
+        
+        # Bypass lane can only accept 2 rows per bus cycle (1 beat = 2 rows)
+        self.bus_transfer_limit = 2 if is_bypass else BEATS_ON_BUS
 
     def decode_token(self, token: int) -> TokenInfo:
+        if self.is_bypass:
+            # Bypass rows take exactly 1 cycle and instantly output a row (barrier)
+            return TokenInfo(int(token), "CMD", 0, True, False, 1)
+
         """Parses a raw integer ONCE and returns all hardware traits."""
         t = int(token)
         payload = t & 0xFFFF
@@ -115,7 +101,6 @@ class SubDecoder():
     
     def can_accept(self, token_info: TokenInfo) -> bool:
         """Evaluates if the appropriate FIFO has space for the decoded token."""
-        # The bus only cares if the input FIFOs are full. Output stalls happen downstream.
         if token_info.category == "LIT":
             return len(self.LIT_FIFO) < self.LIT_FIFO.maxlen
         else:
@@ -130,6 +115,8 @@ class SubDecoder():
 
     def tick(self):
         """Advances the clock cycle by 1 for the execution unit."""
+        self.is_lit_starved = False
+        
         # Process active task
         if self.cycles_left > 0:
             self.cycles_left -= 1
@@ -145,6 +132,7 @@ class SubDecoder():
                 return # Stall waiting for bus to deliver seed
                 
             if next_tok.category == "CMD" and len(self.LIT_FIFO) < next_tok.req_lit_chunks:
+                self.is_lit_starved = True
                 return # Stall waiting for bus to deliver literals
                 
             if next_tok.is_barrier and len(self.OUTPUT_FIFO) == self.OUTPUT_FIFO.maxlen:
@@ -168,49 +156,61 @@ class SubDecoder():
             self.cycles_left = executed_tok.cycles
             self.active_cycles += 1
 
-
 class DecoderEnvV2(gym.Env):
-    def __init__(self, data_dir: str, train_split_pct: float = 0.8, is_eval: bool = False, seed: int = 42):
+    def __init__(self, data_dir: str, train_split_pct: float = 0.8, is_eval: bool = False, seed: int = 42, is_inference: bool = False):
         self.data_dir = Path(data_dir)
         if not self.data_dir.is_dir():
             raise ValueError(f"data_dir must be a directory: {data_dir}")
             
-        # Discover all subfolders that contain a 'beats_hex' folder
-        all_datasets = []
-        for test_folder in sorted(self.data_dir.iterdir()):
-            if test_folder.is_dir():
-                hex_dir = test_folder / "beats_hex"
-                if hex_dir.exists() and hex_dir.is_dir():
-                    try:
-                        cmds = self._load_hex_folder(hex_dir)
-                        all_datasets.append(cmds)
-                    except Exception as e:
-                        print(f"Skipping {test_folder.name} due to error: {e}")
-                        
-        if not all_datasets:
-            raise ValueError(f"No valid datasets found in {data_dir}")
+        if is_inference:
+            # Single dataset mode for deployment
+            hex_dir = self.data_dir / "beats_hex"
+            if not hex_dir.exists() or not hex_dir.is_dir():
+                # Fallback if they pointed directly to the beats_hex folder
+                if self.data_dir.name == "beats_hex":
+                    hex_dir = self.data_dir
+                else:
+                    raise ValueError(f"Inference mode requires a 'beats_hex' folder in {self.data_dir}")
             
-        # Deterministically shuffle to create consistent train/eval splits
-        rng = random.Random(seed)
-        rng.shuffle(all_datasets)
-        
-        # Split datasets
-        split_idx = max(1, int(len(all_datasets) * train_split_pct))
-        
-        if is_eval:
-            self.dataset_pool = all_datasets[split_idx:]
-            # Fallback if split leaves eval empty
-            if not self.dataset_pool:
-                print("Warning: train_split_pct too high, using all datasets for eval.")
-                self.dataset_pool = all_datasets
+            cmds = self._load_hex_folder(hex_dir)
+            self.dataset_pool = [cmds]
+            print(f"Loaded single dataset for inference from: {self.data_dir}")
         else:
-            self.dataset_pool = all_datasets[:split_idx]
+            # Discover all subfolders that contain a 'beats_hex' folder
+            all_datasets = []
+            for test_folder in sorted(self.data_dir.iterdir()):
+                if test_folder.is_dir():
+                    hex_dir = test_folder / "beats_hex"
+                    if hex_dir.exists() and hex_dir.is_dir():
+                        try:
+                            cmds = self._load_hex_folder(hex_dir)
+                            all_datasets.append(cmds)
+                        except Exception as e:
+                            print(f"Skipping {test_folder.name} due to error: {e}")
+                            
+            if not all_datasets:
+                raise ValueError(f"No valid datasets found in {data_dir}")
+                
+            # Deterministically shuffle to create consistent train/eval splits
+            rng = random.Random(seed)
+            rng.shuffle(all_datasets)
             
-        print(f"Loaded {len(self.dataset_pool)} datasets for {'evaluation' if is_eval else 'training'}.")
+            # Split datasets
+            split_idx = max(1, int(len(all_datasets) * train_split_pct))
+            
+            if is_eval:
+                self.dataset_pool = all_datasets[split_idx:]
+                if not self.dataset_pool:
+                    print("Warning: train_split_pct too high, using all datasets for eval.")
+                    self.dataset_pool = all_datasets
+            else:
+                self.dataset_pool = all_datasets[:split_idx]
+                
+            print(f"Loaded {len(self.dataset_pool)} datasets for {'evaluation' if is_eval else 'training'}.")
         
         self.decoders = []
         for i in range(NUM_DECODERS):
-            self.decoders.append(SubDecoder())
+            self.decoders.append(SubDecoder(is_bypass=(i == 8)))
             
         self.num_cycles = 0
         self.stall_cycles = 0
@@ -303,14 +303,17 @@ class DecoderEnvV2(gym.Env):
         # --- Bus Transfer Phase ---
         if self.cmds[target_sub_d]:
             i = 0
-            while i < BEATS_ON_BUS and self.cmds[target_sub_d]:
+            subdecoder = self.decoders[target_sub_d]
+            while i < subdecoder.bus_transfer_limit and self.cmds[target_sub_d]:
                 raw_cmd = self.cmds[target_sub_d][0]
-                subdecoder = self.decoders[target_sub_d]
                 
-                # Decode once at the boundary
                 token_info = subdecoder.decode_token(raw_cmd)
                 
                 if subdecoder.can_accept(token_info):
+                    # NEW: Punish the agent for sending a CMD to a decoder starved for LITs
+                    if token_info.category == "CMD" and subdecoder.is_lit_starved:
+                        reward -= 2.0 
+                        
                     self.cmds[target_sub_d].popleft()
                     subdecoder.receive_token(token_info)
                     i += 1
@@ -319,35 +322,19 @@ class DecoderEnvV2(gym.Env):
                     # Hardware block (FIFO Full or Output Buffer Full). Yield the bus.
                     break 
 
-        # Track stalls: if the bus pushed nothing but there is still work to do
+        # --- Instant Micro-Penalty for Wasting the Bus ---
         if tokens_pushed == 0 and any(len(q) > 0 for q in self.cmds):
             self.stall_cycles += 1
-            reward -= 5.0
+            reward -= 5.0 # ZAP! Punish the agent instantly for picking a blocked/empty decoder
         else:
             self.stall_cycles = 0
-
-        # --- Deadlock Detection & Penalty ---
-        if self.stall_cycles > DEADLOCK_THRESHOLD:
-            terminated = True
-            # Count exactly how much work the agent failed to finish
-            remaining_tokens = sum(len(q) for q in self.cmds)
-            
-            # Make the penalty mathematically worse than taking 10 cycles per remaining token
-            dynamic_penalty = (remaining_tokens * 10.0) + 50000.0
-            reward -= dynamic_penalty
-            info["deadlock"] = True
-            observation = self._get_obs()
-            return observation, reward, terminated, truncated, info
 
         # --- Execution Phase ---
         self.step_sub_decoders()
 
         # --- Dynamic Output Buffer Synchronization Phase ---
-        # Hardware row buffers drain when all active subdecoders have pushed 
-        # at least one completed row into their output FIFOs.
         active_decoders = []
         for idx, sub_d in enumerate(self.decoders):
-            # A subdecoder is truly finished only if its output is also completely flushed
             is_permanently_finished = (
                 len(self.cmds[idx]) == 0 and 
                 len(sub_d.CMD_FIFO) == 0 and 
@@ -361,32 +348,49 @@ class DecoderEnvV2(gym.Env):
         if active_decoders and all(len(sub_d.OUTPUT_FIFO) > 0 for sub_d in active_decoders):
             for sub_d in active_decoders:
                 sub_d.OUTPUT_FIFO.popleft()
+            # NEW: Massive positive reward for successfully completing a global barrier flush!
             reward += 20.0 
 
-        # --- Reward Shaping Phase ---
-        # 1. Throughput calculation (+1.0 per token moved, -1.0 per cycle)
-        # 2. Deadzone Imbalance penalty (Safe margin = 2 rows. Exceeding costs points.)
+        # --- Proportional Deadlock Penalty ---
+        if getattr(self, 'stall_cycles', 0) > 500:
+            terminated = True
+            
+            # Count exactly how much work the agent failed to finish
+            remaining_tokens = sum(len(q) for q in self.cmds)
+            
+            # Make the penalty mathematically worse than taking 10 cycles per remaining token
+            dynamic_penalty = (remaining_tokens * 10.0) + 50000.0
+            reward -= dynamic_penalty
+            
+            info["deadlock"] = True
+            return self._get_obs(), reward, terminated, truncated, info
+
+        # --- Reward Shaping Phase (Throughput & Imbalance) ---
         row_counts = [len(sub_d.OUTPUT_FIFO) for sub_d in self.decoders]
         row_spread = max(row_counts) - min(row_counts)
         
         SAFE_MARGIN = 2
+        HARD_LIMIT = 4
         imbalance_penalty = 0.0
         if row_spread > SAFE_MARGIN:
-            excess_spread = row_spread - SAFE_MARGIN
-            imbalance_penalty = (excess_spread ** 2) * 0.5
+            distance_to_failure = HARD_LIMIT - row_spread
+            if distance_to_failure <= 0:
+                imbalance_penalty = 100.0 # Instant hard penalty
+            else:
+                imbalance_penalty = 1.0 / distance_to_failure 
             
-        reward = (tokens_pushed * 1.0) - imbalance_penalty - 1.0
+        reward += (tokens_pushed * 1.0) - imbalance_penalty - 1.0
         
         # --- Termination Phase ---
         if all(len(q) == 0 for q in self.cmds) and all(sub_d.cycles_left == 0 for sub_d in self.decoders) and all(len(sub_d.OUTPUT_FIFO) == 0 for sub_d in self.decoders):
             terminated = True
-            
-            # Pass final diagnostic metrics to the PPO Monitor callback
             info["makespan"] = self.num_cycles
             info["decoder_times"] = [sub_d.active_cycles for sub_d in self.decoders]
 
-        observation = self._get_obs()
-        return observation, reward, terminated, truncated, info
+        # Pass the number of tokens successfully transferred this cycle
+        info["tokens_pushed"] = tokens_pushed
+
+        return self._get_obs(), reward, terminated, truncated, info
     
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -396,13 +400,11 @@ class DecoderEnvV2(gym.Env):
         selected_dataset = self.dataset_pool[selected_idx]
 
         self.cmds = [deque(list(queue)) for queue in selected_dataset]
-        self.decoders = [SubDecoder() for _ in range(NUM_DECODERS)]
+        self.decoders = [SubDecoder(is_bypass=(i == 8)) for i in range(NUM_DECODERS)]
         self.num_cycles = 0
         self.stall_cycles = 0
 
-        observation = self._get_obs()
-        info = {}
-        return observation, info
+        return self._get_obs(), {}
 
     def _get_obs(self):
         obs = {
@@ -412,33 +414,27 @@ class DecoderEnvV2(gym.Env):
             "is_stalled_by_output": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_done": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_lit_starved": np.zeros(NUM_DECODERS, dtype=np.int8),
-            "lookahead_types": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.int32), # Pad with -1
+            "lookahead_types": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.int32), 
             "lookahead_cycles": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32)
         }
         
         type_mapping = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}
 
         for i, sub_d in enumerate(self.decoders):
-            # 1. Fill basic status & normalize
             obs["cycles_left"][i] = min(sub_d.cycles_left / MAX_CYCLES_LEFT, 1.0) 
             obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
             obs["lit_fifo_fill"][i] = len(sub_d.LIT_FIFO) / LIT_FIFO_SIZE
             obs["is_stalled_by_output"][i] = int(len(sub_d.OUTPUT_FIFO) == sub_d.OUTPUT_FIFO.maxlen)
             obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0 and len(sub_d.OUTPUT_FIFO) == 0)
+            obs["is_lit_starved"][i] = int(sub_d.is_lit_starved)
 
-            # 2. Check Literal Starvation
-            if len(sub_d.CMD_FIFO) > 0:
-                head_tok = sub_d.CMD_FIFO[0]
-                if head_tok.category == "CMD" and len(sub_d.LIT_FIFO) < head_tok.req_lit_chunks:
-                    obs["is_lit_starved"][i] = 1
-
-            # 3. Populate Lookahead Buffer
+            # Populate Lookahead Buffer
             bus_queue = self.cmds[i]
-            window_size = min(LOOKAHEAD_WINDOW, len(bus_queue))
+            window_size = min(len(bus_queue), LOOKAHEAD_WINDOW)
             
             for j in range(window_size):
                 raw_token = bus_queue[j]
-                token_info = sub_d.decode_token(raw_token) # Peek and decode
+                token_info = sub_d.decode_token(raw_token) 
                 
                 obs["lookahead_types"][i, j] = type_mapping.get(token_info.category, -1)
                 obs["lookahead_cycles"][i, j] = min(token_info.cycles / MAX_CYCLES_LEFT, 1.0)
