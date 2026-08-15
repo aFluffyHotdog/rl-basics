@@ -48,7 +48,6 @@ def generate_sequence(model_path: str, data_dir: str, output_path: str):
         obs, rewards, dones, infos = env.step(action)
         done = dones[0]
         
-        # CRITICAL SIM2REAL FIX:
         # Only record the action in the final schedule if data actually crossed the bus!
         # This ignores stalled cycles and turns the schedule into a robust, ordered data log.
         if infos[0].get("tokens_pushed", 0) > 0:
@@ -107,3 +106,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     generate_sequence(args.model_path, args.data_dir, args.output)
+
+# USAGE: python3  .\deployment\generate_seq.py --model_path models\checkpoints_20260811_111851\ppo_makespan_resumed_33000000_steps.zip --data_dir sample_data_9_lanes\test_11_lantern\beats_hex

@@ -21,10 +21,12 @@ import numpy as np
 
 LIT_FIFO_SIZE = 72 # 24/24/18/12
 CMD_FIFO_SIZE = 16
+BYPASS_FIFO_SIZE = 8
 BEATS_ON_BUS = 8
 NUM_DECODERS = 9
-LOOKAHEAD_WINDOW = 128 # Deep lookahead for Action Masking / PPO planning
+LOOKAHEAD_WINDOW = 64 # Deep lookahead for Action Masking / PPO planning
 OUTPUT_ROW_BUFFER_SIZE = 4 # How many rows ahead a subdecoder can get before stalling
+FIFO_HOARD_THRESH = 0.75
 
 CMD_TYPE=0
 LIT_TYPE=1
@@ -43,11 +45,14 @@ class TokenInfo:
 
 class SubDecoder():
     def __init__(self, is_bypass=False):
-        # NOTE: 1 chunk = 16 bit
-        # 24/24/18/12 * 4 chunk LIT FIFO buffers
+        # NOTE: 1 chunk = 16 bit / 2 bytes
         self.LIT_FIFO = deque(maxlen=LIT_FIFO_SIZE)
-        # 16 chunk CMD FIFO buffer
-        self.CMD_FIFO = deque(maxlen=CMD_FIFO_SIZE)
+        
+        # Bypass lane has a much smaller CMD FIFO (skid buffer) in the RTL
+        fifo_depth = BYPASS_FIFO_SIZE if is_bypass else CMD_FIFO_SIZE
+        # 16 chunk CMD FIFO buffer (or smaller for bypass)
+        self.CMD_FIFO = deque(maxlen=fifo_depth)
+        
         # 4-row output FIFO
         self.OUTPUT_FIFO = deque(maxlen=OUTPUT_ROW_BUFFER_SIZE)
         
@@ -157,7 +162,7 @@ class SubDecoder():
             self.active_cycles += 1
 
 class DecoderEnvV2(gym.Env):
-    def __init__(self, data_dir: str, train_split_pct: float = 0.8, is_eval: bool = False, seed: int = 42, is_inference: bool = False):
+    def __init__(self, data_dir: str, train_split_pct: float = 1.0, is_eval: bool = False, seed: int = 42, is_inference: bool = False):
         self.data_dir = Path(data_dir)
         if not self.data_dir.is_dir():
             raise ValueError(f"data_dir must be a directory: {data_dir}")
@@ -310,7 +315,7 @@ class DecoderEnvV2(gym.Env):
                 token_info = subdecoder.decode_token(raw_cmd)
                 
                 if subdecoder.can_accept(token_info):
-                    # NEW: Punish the agent for sending a CMD to a decoder starved for LITs
+                    # Punish the agent for sending a CMD to a decoder starved for LITs
                     if token_info.category == "CMD" and subdecoder.is_lit_starved:
                         reward -= 2.0 
                         
@@ -348,7 +353,7 @@ class DecoderEnvV2(gym.Env):
         if active_decoders and all(len(sub_d.OUTPUT_FIFO) > 0 for sub_d in active_decoders):
             for sub_d in active_decoders:
                 sub_d.OUTPUT_FIFO.popleft()
-            # NEW: Massive positive reward for successfully completing a global barrier flush!
+            # Massive positive reward for successfully completing a global barrier flush!
             reward += 20.0 
 
         # --- Proportional Deadlock Penalty ---
@@ -359,7 +364,7 @@ class DecoderEnvV2(gym.Env):
             remaining_tokens = sum(len(q) for q in self.cmds)
             
             # Make the penalty mathematically worse than taking 10 cycles per remaining token
-            dynamic_penalty = (remaining_tokens * 10.0) + 50000.0
+            dynamic_penalty = (remaining_tokens * 10.0) + 500.0
             reward -= dynamic_penalty
             
             info["deadlock"] = True
@@ -378,8 +383,17 @@ class DecoderEnvV2(gym.Env):
                 imbalance_penalty = 100.0 # Instant hard penalty
             else:
                 imbalance_penalty = 1.0 / distance_to_failure 
+                
+        # Input FIFO Hoarding Penalty
+        # Encourage just-in-time delivery. Small penalty for keeping queues > 50% full.
+        hoard_penalty = 0.0
+        for sub_d in self.decoders:
+            if not sub_d.is_bypass:  # Bypass queue is so small it doesn't matter
+                cmd_util = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
+                if cmd_util > FIFO_HOARD_THRESH:
+                    hoard_penalty += (cmd_util - FIFO_HOARD_THRESH) * FIFO_HOARD_THRESH
             
-        reward += (tokens_pushed * 1.0) - imbalance_penalty - 1.0
+        reward += (tokens_pushed * 1.0) - imbalance_penalty - hoard_penalty - 1.0
         
         # --- Termination Phase ---
         if all(len(q) == 0 for q in self.cmds) and all(sub_d.cycles_left == 0 for sub_d in self.decoders) and all(len(sub_d.OUTPUT_FIFO) == 0 for sub_d in self.decoders):
@@ -422,7 +436,9 @@ class DecoderEnvV2(gym.Env):
 
         for i, sub_d in enumerate(self.decoders):
             obs["cycles_left"][i] = min(sub_d.cycles_left / MAX_CYCLES_LEFT, 1.0) 
-            obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
+            
+            # Use dynamic maxlen for observation normalization
+            obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / sub_d.CMD_FIFO.maxlen
             obs["lit_fifo_fill"][i] = len(sub_d.LIT_FIFO) / LIT_FIFO_SIZE
             obs["is_stalled_by_output"][i] = int(len(sub_d.OUTPUT_FIFO) == sub_d.OUTPUT_FIFO.maxlen)
             obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0 and len(sub_d.OUTPUT_FIFO) == 0)
