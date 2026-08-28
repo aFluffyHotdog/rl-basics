@@ -50,6 +50,9 @@ class SubDecoder():
         
         # Bypass lane has a much smaller CMD FIFO (skid buffer) in the RTL
         fifo_depth = BYPASS_FIFO_SIZE if is_bypass else CMD_FIFO_SIZE
+        # Bypass lane can only accept 2 rows per bus cycle (1 beat = 2 rows)
+        self.bus_transfer_limit = 2 if is_bypass else BEATS_ON_BUS
+
         # 16 chunk CMD FIFO buffer (or smaller for bypass)
         self.CMD_FIFO = deque(maxlen=fifo_depth)
         
@@ -62,9 +65,6 @@ class SubDecoder():
         self.is_lit_starved = False
         self.is_bypass = is_bypass
         
-        # Bypass lane can only accept 2 rows per bus cycle (1 beat = 2 rows)
-        self.bus_transfer_limit = 2 if is_bypass else BEATS_ON_BUS
-
     def decode_token(self, token: int) -> TokenInfo:
         if self.is_bypass:
             # Bypass rows take exactly 1 cycle and instantly output a row (barrier)
@@ -85,7 +85,8 @@ class SubDecoder():
 
         # 3. Identify RLE vs CMD using Bit 15
         is_rle = (type_code == RLE_TYPE) or (type_code == CMD_TYPE and ((payload >> 15) & 0x1 == 1))
-        
+
+        # 4. Calculate the required cycles
         if is_rle:
             rle_length = (payload >> 11) & 0xF
             cycles = 2 if rle_length > 7 else 1
@@ -225,11 +226,14 @@ class DecoderEnvV2(gym.Env):
             "cycles_left": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
             "cmd_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
             "lit_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            "output_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
             "is_stalled_by_output": gym.spaces.MultiBinary(NUM_DECODERS),
             "is_done": gym.spaces.MultiBinary(NUM_DECODERS),
             "is_lit_starved": gym.spaces.MultiBinary(NUM_DECODERS),
             "lookahead_types": gym.spaces.Box(low=-1, high=3, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.int32),
+            "lookahead_req_lits": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
             "lookahead_cycles": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
+            "lookahead_is_barrier": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
         })
 
     def _load_hex_folder(self, cmd_path: str) -> list:
@@ -353,7 +357,7 @@ class DecoderEnvV2(gym.Env):
         if active_decoders and all(len(sub_d.OUTPUT_FIFO) > 0 for sub_d in active_decoders):
             for sub_d in active_decoders:
                 sub_d.OUTPUT_FIFO.popleft()
-            # Massive positive reward for successfully completing a global barrier flush!
+            # big reward for successfully outputting a row
             reward += 20.0 
 
         # --- Proportional Deadlock Penalty ---
@@ -391,7 +395,7 @@ class DecoderEnvV2(gym.Env):
             if not sub_d.is_bypass:  # Bypass queue is so small it doesn't matter
                 cmd_util = len(sub_d.CMD_FIFO) / CMD_FIFO_SIZE
                 if cmd_util > FIFO_HOARD_THRESH:
-                    hoard_penalty += (cmd_util - FIFO_HOARD_THRESH) * FIFO_HOARD_THRESH
+                    hoard_penalty += (cmd_util - FIFO_HOARD_THRESH) * 10.0
             
         reward += (tokens_pushed * 1.0) - imbalance_penalty - hoard_penalty - 1.0
         
@@ -417,6 +421,7 @@ class DecoderEnvV2(gym.Env):
         self.decoders = [SubDecoder(is_bypass=(i == 8)) for i in range(NUM_DECODERS)]
         self.num_cycles = 0
         self.stall_cycles = 0
+        self.initial_total_tokens = sum(len(cmd) for cmd in self.cmds)
 
         return self._get_obs(), {}
 
@@ -425,11 +430,14 @@ class DecoderEnvV2(gym.Env):
             "cycles_left": np.zeros(NUM_DECODERS, dtype=np.float32),
             "cmd_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
             "lit_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "output_fifo_fill": np.zeros(NUM_DECODERS, dtype=np.float32),
             "is_stalled_by_output": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_done": np.zeros(NUM_DECODERS, dtype=np.int8),
             "is_lit_starved": np.zeros(NUM_DECODERS, dtype=np.int8),
             "lookahead_types": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.int32), 
-            "lookahead_cycles": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32)
+            "lookahead_cycles": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
+            "lookahead_req_lits": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
+            "lookahead_is_barrier": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32)
         }
         
         type_mapping = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}
@@ -440,6 +448,8 @@ class DecoderEnvV2(gym.Env):
             # Use dynamic maxlen for observation normalization
             obs["cmd_fifo_fill"][i] = len(sub_d.CMD_FIFO) / sub_d.CMD_FIFO.maxlen
             obs["lit_fifo_fill"][i] = len(sub_d.LIT_FIFO) / LIT_FIFO_SIZE
+            obs["output_fifo_fill"][i] = len(sub_d.OUTPUT_FIFO) / sub_d.OUTPUT_FIFO.maxlen
+
             obs["is_stalled_by_output"][i] = int(len(sub_d.OUTPUT_FIFO) == sub_d.OUTPUT_FIFO.maxlen)
             obs["is_done"][i] = int(len(self.cmds[i]) == 0 and len(sub_d.CMD_FIFO) == 0 and sub_d.cycles_left == 0 and len(sub_d.OUTPUT_FIFO) == 0)
             obs["is_lit_starved"][i] = int(sub_d.is_lit_starved)
@@ -454,5 +464,10 @@ class DecoderEnvV2(gym.Env):
                 
                 obs["lookahead_types"][i, j] = type_mapping.get(token_info.category, -1)
                 obs["lookahead_cycles"][i, j] = min(token_info.cycles / MAX_CYCLES_LEFT, 1.0)
-                
+                obs["lookahead_req_lits"][i, j] = token_info.req_lit_chunks / 15.0
+                obs["lookahead_is_barrier"][i, j] = float(token_info.is_barrier)
+
+        total_remaining = sum(len(q) for q in self.cmds)
+        obs["global_progress"] = np.array([total_remaining / max(1, self.initial_total_tokens)], dtype=np.float32)
+
         return obs
