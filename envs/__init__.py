@@ -14,3 +14,10 @@ register(
     entry_point="envs.decoder_env_v2:DecoderEnvV2",
     max_episode_steps=(1080 * 720) // 4,
 )
+
+# v2: new environment implementation
+register(
+    id="DecoderEnvV3",
+    entry_point="envs.decoder_env_v3:DecoderEnvV3",
+    max_episode_steps=(1080 * 720) // 4,
+)
