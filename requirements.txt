@@ -58,7 +58,6 @@ tensorboard==2.20.0
 tensorboard-data-server==0.7.2
 torch==2.12.0
 tqdm==4.68.2
-triton==3.7.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.7.0
