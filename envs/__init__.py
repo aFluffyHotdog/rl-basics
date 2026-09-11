@@ -1,6 +1,6 @@
 from gymnasium import register
 
-__all__ = ["DecoderEnv", "DecoderEnvV2"]
+__all__ = ["DecoderEnv", "DecoderEnvV2","DecoderEnvV3", "DecoderEnvXSim"]
 
 register(
     id="DecoderEnv-v0",
@@ -17,7 +17,13 @@ register(
 
 # v2: new environment implementation
 register(
-    id="DecoderEnvV3",
+    id="DecoderEnvV3-v0",
     entry_point="envs.decoder_env_v3:DecoderEnvV3",
     max_episode_steps=(1080 * 720) // 4,
+)
+
+# v3: integrated with xsim
+register(
+    id="DecoderEnvXSim-v0",
+    entry_point="envs.decoder_env_xsim:DecoderEnvXSim",
 )
