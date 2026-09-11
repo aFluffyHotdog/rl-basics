@@ -275,24 +275,27 @@ class DecoderEnvXSim(gym.Env):
         
         # Randomly select one dataset from the pool for this episode
         selected_idx = self.np_random.integers(0, len(self.dataset_pool))
-        
-        # Unpack the specific path stem and the data queues
         selected_stem_path, selected_dataset = self.dataset_pool[selected_idx]
 
         self.cmds = [deque(list(queue)) for queue in selected_dataset]
         self.initial_tokens = sum(len(cmd) for cmd in self.cmds)
         self.cycles = 0
         
-        # Reboot the simulator for a clean hardware state
-        self._start_sim()
-        #
+        # --- NEW: Process Reuse Logic ---
+        if self.sim_proc is None:
+            print("Booting Vivado for the first time...")
+            self._start_sim()
+        else:
+            # Instantly rewind the simulation time to 0
+            self.sim_proc.stdin.write("restart\n")
+            self.sim_proc.stdin.flush()
+            
+        # Unpause the clock so it hits the Handshake block
         self._resume_sim()
-        # Wait for @HANDSHAKE_READY
         self._wait_for_obs() 
         
         # Send the exact initialization path for this specific dataset!
         stem_str = str(selected_stem_path).replace("\\", "/")
-        # the simulation needs the rows file in order to check output, replace the path
         stem_str = str(selected_stem_path).replace("beats_hex", "rows_hex")
         print(f"[Env] Sending Handshake Stem: {stem_str}")
         self._write_action(stem_str)
@@ -328,9 +331,9 @@ class DecoderEnvXSim(gym.Env):
                     # pop from the left to keep endian-ness
                     for _ in range(needed):
                         token = self.cmds[action].popleft()
-                        
+                        clean_16b_token = token & 0xFFFF
                         # Place token into the correct slot (Slot 0 = LSB) ---
-                        payload_128b = payload_128b | (token << (slots_used * 16))
+                        payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
                         slots_used += 1
                 else:
                     break
@@ -359,7 +362,7 @@ class DecoderEnvXSim(gym.Env):
         
         # Hardware Corruption Penalty
         if self.hw_state["mismatches"] > 0:
-            reward -= 1000.0
+            reward -= 100.0
             return self._get_obs(), reward, True, False, {"deadlock": True, "mismatch": True}
 
         # Micro-Penalty for Wasting the Bus
@@ -375,7 +378,7 @@ class DecoderEnvXSim(gym.Env):
 
         #  Proportional Deadlock Penalty
         if getattr(self, 'stall_cycles', 0) > 500:
-            reward -= 1000.0
+            reward -= 100.0
             return self._get_obs(), reward, True, False, {"deadlock": True}
 
         # Reward Shaping Phase (Throughput & Imbalance)
