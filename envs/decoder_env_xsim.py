@@ -10,8 +10,11 @@ from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 
+from PIL.FtexImagePlugin import Format
 import gymnasium as gym
 import numpy as np
+
+VIVADO_VERBOSE = True
 
 # Hardware Constants
 NUM_DECODERS = 9      # 0-7 are LC/RLE, 8 is Bypass
@@ -68,10 +71,8 @@ class DecoderEnvXSim(gym.Env):
 
         # Load data
         if is_inference:
-            # ... (keep your existing inference folder check) ...
-            
             cmds = self._load_hex_folder(hex_dir)
-            # DYNAMIC STEM EXTRACTION:
+            
             # Grab the prefix from a file like "test_11_lantern_subdec0_beats.hex"
             first_file = next(hex_dir.glob('*.hex')).name
             stem_name = first_file.split('_subdec')[0] 
@@ -211,23 +212,41 @@ class DecoderEnvXSim(gym.Env):
         self.sim_proc.stdin.flush()
 
     def _wait_for_obs(self):
+        found_obs = False
+        
         while True:
             line = self.sim_proc.stdout.readline()
             if not line:
                 raise RuntimeError("Simulation crashed or closed unexpectedly.")
-            line_str = line.strip()
             
-            if not line_str.startswith("@OBS"): 
-                print(f"[Vivado] {line_str}")
-            
-            if line_str.startswith("@HANDSHAKE_READY"):
-                print(f"[Vivado] {line_str}")
-                return line_str
+            if not line:
+                continue
+
+            # 2. Parse Handshake
+            if line.startswith("@HANDSHAKE_READY"):
+                if VIVADO_VERBOSE:
+                    print(f"[Vivado] {line}")
+                self.handshake_ready = True
+                return line
                 
-            if line_str.startswith("@OBS"):
-                print(f"[Vivado] {line_str}")
-                self._parse_obs(line_str)
-                return line_str
+            # 3. Parse Observation (BUT DO NOT RETURN YET!)
+            if line.startswith("@OBS"):
+                if VIVADO_VERBOSE:
+                    print(f"[Vivado] {line}")
+                self._parse_obs(line)
+                found_obs = True
+                continue
+                
+            # 4. NEW EXIT TRIGGER: Only return when Vivado is fully paused
+            if "$stop called at time" in line:
+                if found_obs:
+                    return line
+                else:
+                    continue
+                    
+            # 5. Optional Verbose Catch-all
+            if not found_obs and VIVADO_VERBOSE:
+                print(f"[Vivado] {line}")
 
     def _parse_obs(self, obs_str: str):
         """Parses the @OBS string directly from Verilog."""
@@ -265,6 +284,23 @@ class DecoderEnvXSim(gym.Env):
             if len(self.cmds[i]) > 0:
                 mask[i] = True
                 work_remaining = True
+
+                # check the state of FIFO for sub-decoders
+                if i < 8:
+                    hw_sd = self.hw_state["sub_decoders"][i]
+                
+                    # Protect the CMD FIFO
+                    if hw_sd["cmd"] > 14:
+                        mask[i] = False
+                        continue 
+                    
+                    # Protect ALL 4 LIT Banks based on their unbalanced physical depths (24, 24, 18, 12)
+                    if (hw_sd["lit1"] > 16 or 
+                        hw_sd["lit2"] > 16 or 
+                        hw_sd["lit3"] > 10 or 
+                        hw_sd["lit4"] > 4):
+                        mask[i] = False
+                        continue
                 
         if not work_remaining:
             mask[NO_OP_ACTION] = True
@@ -281,7 +317,7 @@ class DecoderEnvXSim(gym.Env):
         self.initial_tokens = sum(len(cmd) for cmd in self.cmds)
         self.cycles = 0
         
-        # --- NEW: Process Reuse Logic ---
+        # Process Reuse Logic
         if self.sim_proc is None:
             print("Booting Vivado for the first time...")
             self._start_sim()
@@ -314,11 +350,11 @@ class DecoderEnvXSim(gym.Env):
         slots_used = 0
 
         if action == NO_OP_ACTION:
+            action_hex = "0" * 34
             valid_bit = 0
-            action_dest = 0
         else:
             action_dest = action
-            
+            commands_packed = 0
             # Pack up to 8 slots
             while slots_used < BEATS_ON_BUS and self.cmds[action]:
                 if action == 8: # Bypass lane takes raw data
@@ -335,22 +371,28 @@ class DecoderEnvXSim(gym.Env):
                         # Place token into the correct slot (Slot 0 = LSB) ---
                         payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
                         slots_used += 1
+
+                    commands_packed += 1
                 else:
                     break
 
-        # 135-bit payload: [134:131]=dest, [130:3]=payload, [2:0]=0
-        # Format the 4-bit destination index as a binary string
-        dest_bin = f"{action_dest:04b}"
-        # Format the 128-bit packed payload as a binary string
-        payload_bin = f"{payload_128b:0128b}"
-        # Create the 3-bit zero padding for the bottom bits [2:0]
-        padding_bin = "000"
-        
-        # Concatenate them into a perfect 135-bit string
-        full_135b_string = dest_bin + payload_bin + padding_bin
-        
-        # Convert the binary string directly into a 34-character hex string for Vivado
-        action_hex = f"{int(full_135b_string, 2):034x}"
+            # Format the 4-bit destination index: Bits [134:131]
+            dest_bin = f"{action_dest:04b}"
+            
+            # Format the 3-bit Control Field (ncmd - 1): Bits [130:128]
+            if action == 8 or commands_packed == 0:
+                ncmd_bin = "000" # Bypass lane and empty payloads default to 0
+            else:
+                ncmd_bin = f"{commands_packed - 1:03b}"
+                
+            # Format the 128-bit packed payload: Bits [127:0]
+            payload_bin = f"{payload_128b:0128b}"
+            
+            # Concatenate them into a perfect 135-bit string
+            full_135b_string = dest_bin + ncmd_bin + payload_bin
+            
+            # Convert the binary string directly into a 34-character hex string for Vivado
+            action_hex = f"{int(full_135b_string, 2):034x}"
         
         # Ping-Pong Hardware
         self._write_action(f"{valid_bit} {action_hex}")
@@ -362,8 +404,12 @@ class DecoderEnvXSim(gym.Env):
         
         # Hardware Corruption Penalty
         if self.hw_state["mismatches"] > 0:
-            reward -= 100.0
-            return self._get_obs(), reward, True, False, {"deadlock": True, "mismatch": True}
+            reward -= 20.0
+            print(f"[Env] Hardware Mismatch Detected! Total Mismatches: {self.hw_state['mismatches']}")
+            print(f"[Env] action_hex: {action_hex}")
+            if action == NO_OP_ACTION:
+                print(f"[Env] no-op action used")
+            return self._get_obs(), reward, True, False, {"deadlock": False, "mismatch": True}
 
         # Micro-Penalty for Wasting the Bus
         # If no slots were packed (agent chose NO_OP or target was empty) but work remains
