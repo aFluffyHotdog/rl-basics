@@ -1,0 +1,15 @@
+image              test_16_road.jpg
+subdec             4
+threshold          141
+num_rows           720
+total_beats        2499
+num_beat_lines     2214
+avg_beats_per_row  3.471
+speedup_vs_deser   2.305x
+cmd_count          1157
+lit_count          1324
+rle_count          18
+cmd_copy_only      560
+cmd_lit_only       161
+cmd_lit_copy       418
+cmd_rle            18

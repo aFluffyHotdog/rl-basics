@@ -1,0 +1,15 @@
+image              test_12_tulip.jpg
+subdec             3
+threshold          116
+num_rows           720
+total_beats        1839
+num_beat_lines     1652
+avg_beats_per_row  2.554
+speedup_vs_deser   3.132x
+cmd_count          1150
+lit_count          684
+rle_count          5
+cmd_copy_only      668
+cmd_lit_only       45
+cmd_lit_copy       432
+cmd_rle            5

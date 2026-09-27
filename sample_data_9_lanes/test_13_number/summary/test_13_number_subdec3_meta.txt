@@ -1,0 +1,15 @@
+image              test_13_number.jpg
+subdec             3
+threshold          109
+num_rows           720
+total_beats        1245
+num_beat_lines     847
+avg_beats_per_row  1.729
+speedup_vs_deser   4.627x
+cmd_count          915
+lit_count          326
+rle_count          4
+cmd_copy_only      691
+cmd_lit_only       28
+cmd_lit_copy       192
+cmd_rle            4

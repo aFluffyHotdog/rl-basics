@@ -1,0 +1,15 @@
+image              test_14_items.png
+subdec             2
+threshold          123
+num_rows           720
+total_beats        1787
+num_beat_lines     1476
+avg_beats_per_row  2.482
+speedup_vs_deser   3.223x
+cmd_count          1078
+lit_count          696
+rle_count          13
+cmd_copy_only      638
+cmd_lit_only       53
+cmd_lit_copy       374
+cmd_rle            13

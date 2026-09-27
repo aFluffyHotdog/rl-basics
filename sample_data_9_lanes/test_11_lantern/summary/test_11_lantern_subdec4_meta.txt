@@ -1,0 +1,15 @@
+image              test_11_lantern.jpg
+subdec             4
+threshold          125
+num_rows           720
+total_beats        2732
+num_beat_lines     2485
+avg_beats_per_row  3.794
+speedup_vs_deser   2.108x
+cmd_count          1156
+lit_count          1555
+rle_count          21
+cmd_copy_only      475
+cmd_lit_only       213
+cmd_lit_copy       447
+cmd_rle            21

@@ -1,0 +1,15 @@
+image              test_15_maple.jpg
+subdec             4
+threshold          122
+num_rows           720
+total_beats        2078
+num_beat_lines     1744
+avg_beats_per_row  2.886
+speedup_vs_deser   2.772x
+cmd_count          1020
+lit_count          1041
+rle_count          17
+cmd_copy_only      511
+cmd_lit_only       111
+cmd_lit_copy       381
+cmd_rle            17

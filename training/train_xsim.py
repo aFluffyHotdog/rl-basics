@@ -38,7 +38,7 @@ class HwEpisodeStatsCallback(BaseCallback):
     def _init_callback(self):
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w") as f:
-                f.write("step,episode_reward,episode_length,makespan,hw_deadlock\n")
+                f.write("step,episode_reward,episode_length,makespan,images_completed,hw_deadlock\n")
     
     def _on_step(self):
         actions = self.locals["actions"][0]
@@ -60,17 +60,19 @@ class HwEpisodeStatsCallback(BaseCallback):
                 episode_length = info["episode"]["l"]
                 
                 makespan = info.get("makespan", episode_length)
+                images_completed = info.get("images_completed", 0)
                 is_deadlock = info.get("deadlock", False)
                 
                 self.logger.record("hardware/cycle_makespan", makespan)
+                self.logger.record("hardware/images_completed", int(images_completed))
                 self.logger.record("hardware/deadlocks", int(is_deadlock))
                 
                 with open(self.log_file, "a") as f:
-                    f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan},{is_deadlock}\n")
+                    f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan},{images_completed},{is_deadlock}\n")
                 
                 if self.episode_count % 10 == 0: # Print more frequently since HW episodes are slower
                     print(f"\nStep {self.num_timesteps} | HW Episode {self.episode_count}")
-                    print(f"   Makespan (Cycles): {makespan} | Reward: {episode_reward:.3f} | Deadlock: {is_deadlock}")
+                    print(f"   Makespan (Cycles): {makespan} | Reward: {episode_reward:.3f} | Images Completed: {images_completed} | Deadlock: {is_deadlock}")
                     self.action_counts = np.zeros(10)
         return True
 
