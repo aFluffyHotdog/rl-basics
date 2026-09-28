@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
+from torch import signal
 
 VIVADO_VERBOSE = True
 
@@ -222,6 +223,7 @@ class DecoderEnvXSim(gym.Env):
     def _start_sim(self):
         self.close()
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
         self.sim_proc = subprocess.Popen(
             ["xsim.bat", "tb_rl_interactive_snap", "-tclbatch", "quiet_run.tcl", "-R"],
             cwd=str(self.run_dir),
@@ -230,6 +232,7 @@ class DecoderEnvXSim(gym.Env):
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            creationflags=CREATE_NEW_PROCESS_GROUP
         )
 
     def _write_action(self, content: str):
@@ -737,6 +740,8 @@ class DecoderEnvXSim(gym.Env):
                         pass
         finally:
             try:
+                os.kill(self.sim_proc.pid, signal.CTRL_BREAK_EVENT)
+                self.sim_proc.wait(timeout=2)
                 if self.sim_proc.stdin and not self.sim_proc.stdin.closed:
                     self.sim_proc.stdin.close()
             except Exception:
