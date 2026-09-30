@@ -33,6 +33,7 @@ class HwEpisodeStatsCallback(BaseCallback):
         super().__init__()
         self.log_file = log_file
         self.episode_count = 0
+        self.deadlock_count = 0
         self.action_counts = np.zeros(10) # 0-7 Regular, 8 Bypass, 9 No-Op
         
     def _init_callback(self):
@@ -62,10 +63,12 @@ class HwEpisodeStatsCallback(BaseCallback):
                 makespan = info.get("makespan", episode_length)
                 images_completed = info.get("images_completed", 0)
                 is_deadlock = info.get("deadlock", False)
+                self.deadlock_count += int(is_deadlock)
                 
                 self.logger.record("hardware/cycle_makespan", makespan)
                 self.logger.record("hardware/images_completed", int(images_completed))
                 self.logger.record("hardware/deadlocks", int(is_deadlock))
+                self.logger.record("hardware/deadlock_count", self.deadlock_count)
                 
                 with open(self.log_file, "a") as f:
                     f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan},{images_completed},{is_deadlock}\n")
