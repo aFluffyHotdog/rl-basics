@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import argparse
 import numpy as np
 import gymnasium as gym
@@ -34,12 +35,13 @@ class HwEpisodeStatsCallback(BaseCallback):
         self.log_file = log_file
         self.episode_count = 0
         self.deadlock_count = 0
+        self.mismatch_count = 0
         self.action_counts = np.zeros(10) # 0-7 Regular, 8 Bypass, 9 No-Op
         
     def _init_callback(self):
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w") as f:
-                f.write("step,episode_reward,episode_length,makespan,images_completed,hw_deadlock\n")
+                f.write("step,episode_reward,episode_length,makespan,images_completed,hw_deadlock,hw_mismatch\n")
     
     def _on_step(self):
         actions = self.locals["actions"][0]
@@ -63,19 +65,35 @@ class HwEpisodeStatsCallback(BaseCallback):
                 makespan = info.get("makespan", episode_length)
                 images_completed = info.get("images_completed", 0)
                 is_deadlock = info.get("deadlock", False)
+                is_mismatch = info.get("mismatch", False)
                 self.deadlock_count += int(is_deadlock)
+                self.mismatch_count += int(is_mismatch)
+
+                if self.deadlock_count > 0 or self.mismatch_count > 0:
+                    print(f"[Callback] Total Deadlocks: {self.deadlock_count}, Total Mismatches: {self.mismatch_count}")
+                    exit(1)
                 
                 self.logger.record("hardware/cycle_makespan", makespan)
                 self.logger.record("hardware/images_completed", int(images_completed))
                 self.logger.record("hardware/deadlocks", int(is_deadlock))
                 self.logger.record("hardware/deadlock_count", self.deadlock_count)
+                self.logger.record("hardware/mismatches", int(is_mismatch))
+                self.logger.record("hardware/mismatch_count", self.mismatch_count)
+                sample_name = info.get("sample_name")
+                if sample_name:
+                    sample_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_name).strip("._")
+                    if sample_tag:
+                        self.logger.record(
+                            f"hardware/makespan_by_sample/{sample_tag}",
+                            makespan,
+                        )
                 
                 with open(self.log_file, "a") as f:
-                    f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan},{images_completed},{is_deadlock}\n")
+                    f.write(f"{self.num_timesteps},{episode_reward:.4f},{episode_length},{makespan},{images_completed},{is_deadlock},{is_mismatch}\n")
                 
                 if self.episode_count % 10 == 0: # Print more frequently since HW episodes are slower
                     print(f"\nStep {self.num_timesteps} | HW Episode {self.episode_count}")
-                    print(f"   Makespan (Cycles): {makespan} | Reward: {episode_reward:.3f} | Images Completed: {images_completed} | Deadlock: {is_deadlock}")
+                    print(f"   Makespan (Cycles): {makespan} | Reward: {episode_reward:.3f} | Images Completed: {images_completed} | Deadlock: {is_deadlock} | Mismatch: {is_mismatch}")
                     self.action_counts = np.zeros(10)
         return True
 
