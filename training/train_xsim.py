@@ -125,7 +125,7 @@ def main():
         return Monitor(env)
 
     vec_env = DummyVecEnv([make_env])
-    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.999)
 
     # --- 2. Callbacks Setup ---
     stats_cb = HwEpisodeStatsCallback(log_file)
@@ -146,16 +146,19 @@ def main():
         print("Initializing new MaskablePPO Model for Hardware...")
         policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
         model = MaskablePPO(
-            policy="MultiInputPolicy", 
+            policy="MultiInputPolicy",
             env=vec_env,
-            learning_rate=linear_schedule(3e-4),
+            learning_rate=linear_schedule(1e-4),
+            n_steps=16384,
+            batch_size=2048,
+            n_epochs=4,
+            gamma=0.999,
+            gae_lambda=0.97,
             ent_coef=0.01,
-            batch_size=128,
-            n_epochs=10,
-            gamma=0.99,
+            target_kl=0.02,
             verbose=1,
             tensorboard_log="./logs/hw_tensorboard",
-            policy_kwargs=policy_kwargs
+            policy_kwargs=policy_kwargs,
         )
     
     # --- 4. Training Loop ---
