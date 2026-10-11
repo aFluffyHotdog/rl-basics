@@ -14,8 +14,8 @@ from torch import signal
 VIVADO_VERBOSE = False
 
 # Hardware Constants
-NUM_DECODERS = 9      # 0-7 are LC/RLE, 8 is Bypass
-NO_OP_ACTION = 9      # Action index to yield the bus (Valid=0)
+NUM_DECODERS = 8      # 0-7 are LC/RLE
+NO_OP_ACTION = 8      # Action index to yield the bus (Valid=0)
 BEATS_ON_BUS = 8      # Max 16-bit slots per beat
 MAX_CYCLES_LEFT = 16 
 LOOKAHEAD_WINDOW = 64
@@ -24,20 +24,13 @@ LOOKAHEAD_WINDOW = 64
 CMD_FIFO_SIZE = 16
 LIT_FIFO_CAPACITIES = (24, 24, 18, 12)
 OUT_FIFO_SIZE = 4
-BYPASS_FIFO_SIZE = 8
 
 DEADLOCK_STALL_CYCLES = 500
 CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
 
-BYPASS_ROW_BITS = 56
-BYPASS_ROWS_PER_BEAT = 2
-BYPASS_LANE_BITS = 64  
-
 GAMMA = 0.999
-
-INCLUDE_BYPASS_WORK = True  # count bypass-lane decode work in the lower bound (2 ticks/row, old-model estimate)
 
 # Potential-based reward shaping: Phi(s) = -(LB(s) + C_LAG * lag_excess(s)^2), in cycles
 LAG_MARGIN = 2        # rows of output spread tolerated before the lag term kicks in
@@ -101,20 +94,19 @@ class DecoderEnvXSim(gym.Env):
             if not all_datasets:
                 raise ValueError(f"No valid datasets found in {data_dir}")
         
-        # Action Space: 0-7 (Regular), 8 (Bypass), 9 (Yield Bus / NO_OP)
-        self.action_space = gym.spaces.Discrete(10)
+        # Action Space: 0-7 (Regular), 8 (Yield Bus / NO_OP)
+        self.action_space = gym.spaces.Discrete(9)
         
         # Observation Space combining live hardware state and input lookahead
         self.observation_space = gym.spaces.Dict({
             "top_in_ready": gym.spaces.Discrete(2),
             "top_row_valid": gym.spaces.Discrete(2),
             "sub_decoder_fifo_counts": gym.spaces.Box(
-                low=0.0, high=1.0, shape=(8, 6), dtype=np.float32
+                low=0.0, high=1.0, shape=(NUM_DECODERS, 6), dtype=np.float32
             ),
-            "cmd_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32),
-            "lit_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32),
-            "output_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32),
-            "bypass_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "cmd_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            "lit_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            "output_fifo_fill": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
             "lookahead_types": gym.spaces.Box(
                 low=0,
                 high=1,
@@ -157,10 +149,8 @@ class DecoderEnvXSim(gym.Env):
             outputs.append(parsed)
         return outputs
 
-    def _decode_token(self, token: int, is_bypass: bool) -> dict:
+    def _decode_token(self, token: int) -> dict:
         """Parses a raw integer ONCE and returns hardware execution traits."""
-        if is_bypass:
-            return {"category": "CMD", "is_barrier": True, "cycles": 1}
 
         t = int(token)
         payload = t & 0xFFFF
@@ -240,11 +230,10 @@ class DecoderEnvXSim(gym.Env):
         parts = obs_str.split()[1:]
         self.hw_state["top_in_ready"] = int(parts[0])
         self.hw_state["top_row_valid"] = int(parts[1])
-        self.hw_state["bypass_fifo_count"] = int(parts[2])
-        self.hw_state["mismatches"] = int(parts[3])
+        self.hw_state["mismatches"] = int(parts[2])
 
         self.hw_state["sub_decoders"] = []
-        idx = 4
+        idx = 3
         for _ in range(8):
             self.hw_state["sub_decoders"].append({
                 "cmd": int(parts[idx]),
@@ -256,10 +245,8 @@ class DecoderEnvXSim(gym.Env):
             })
             idx += 6
         
-    def _entry_info(self, token, is_bypass):
+    def _entry_info(self, token):
         """Mirror of the old SubDecoder timing: (is_cmd_fifo_entry, ticks, swallows_next_entry)."""
-        if is_bypass:
-            return True, 2, False                       # barrier row: cycles=1 -> 1 start tick + 1
         t = int(token); payload = t & 0xFFFF; type_code = (t >> 16) & 0xF
         if type_code == LIT_TYPE:
             return False, 0, False                      # goes to the literal FIFO
@@ -277,18 +264,18 @@ class DecoderEnvXSim(gym.Env):
         """Call in reset() after self.cmds is loaded, before any pops."""
         self.bus_after, self.entries_upto, self.work_prefix = [], [], []
         for i, q in enumerate(self.cmds):
-            toks, is_byp = list(q), (i == 8)
-            cap = BYPASS_ROWS_PER_BEAT if is_byp else BEATS_ON_BUS   # items one beat can carry
+            toks = list(q)
+            cap = BEATS_ON_BUS   # items one beat can carry
             needs, ent_per_group, costs = [], [], []
             pos, swallow = 0, False
             while pos < len(toks):
-                need = 1 if is_byp else decode_token_slots(toks[pos])[1]
+                need = decode_token_slots(toks[pos])[1]
                 if need > cap:
                     raise ValueError(f"queue {i}: group of {need} slots can never fit on the bus")
                 need = min(need, len(toks) - pos)
                 n_ent = 0
                 for t in toks[pos:pos + need]:
-                    is_entry, ticks, sw = self._entry_info(t, is_byp)
+                    is_entry, ticks, sw = self._entry_info(t)
                     if not is_entry:
                         continue
                     n_ent += 1
@@ -310,11 +297,11 @@ class DecoderEnvXSim(gym.Env):
             self.entries_upto.append(np.concatenate([[0], np.cumsum(ent_per_group)]).astype(np.int64))
             self.work_prefix.append(np.concatenate([[0], np.cumsum(costs)]).astype(np.int64))
 
-        self.n_sent = [0] * NUM_DECODERS      # groups sent per queue (bypass: rows)
+        self.n_sent = [0] * NUM_DECODERS      # groups sent per queue
         self.consumed = [0] * NUM_DECODERS    # cmd-FIFO entries that have left the FIFO
 
         # initial-bound diagnostics: which term sets lb0?
-        lanes = 9 if INCLUDE_BYPASS_WORK else 8
+        lanes = 8
         work0 = [int(wp[-1]) for wp in self.work_prefix]
         self.bus0 = int(sum(int(ba[0]) for ba in self.bus_after))
         self.work0_max = max(work0[:lanes])
@@ -326,11 +313,8 @@ class DecoderEnvXSim(gym.Env):
         bus = sum(int(self.bus_after[i][self.n_sent[i]]) for i in range(NUM_DECODERS))
 
         work_max = 0
-        for i in range(9 if INCLUDE_BYPASS_WORK else 8):
-            if i < 8:
-                in_fifo = sd[i]["cmd"] if i < len(sd) else 0
-            else:
-                in_fifo = self.hw_state.get("bypass_fifo_count", 0)
+        for i in range(8):
+            in_fifo = sd[i]["cmd"] if i < len(sd) else 0
             sent = int(self.entries_upto[i][self.n_sent[i]])
             c = min(max(self.consumed[i], sent - in_fifo), sent)  # monotone, never above entries sent
             self.consumed[i] = c
@@ -370,14 +354,14 @@ class DecoderEnvXSim(gym.Env):
         return self._get_obs(), reward, True, False, {"deadlock": deadlock, "mismatch": mismatch}
 
     def action_masks(self) -> np.ndarray:
-        mask = np.zeros(10, dtype=bool)
+        mask = np.zeros(9, dtype=bool)
         
         # If hardware is stalled, all routes are blocked except Yield (No-Op)
         if self.hw_state.get("top_in_ready", 0) == 0:
             mask[NO_OP_ACTION] = True
             return mask
             
-        # Standard software tracking
+        # Check FIFO banks
         work_remaining = False
         for i in range(NUM_DECODERS):
             if len(self.cmds[i]) > 0:
@@ -385,24 +369,20 @@ class DecoderEnvXSim(gym.Env):
                 work_remaining = True
 
                 # check the state of FIFO for sub-decoders
-                if i < 8:
-                    hw_sd = self.hw_state["sub_decoders"][i]
+                hw_sd = self.hw_state["sub_decoders"][i]
+            
+                # Protect the CMD FIFO
+                if hw_sd["cmd"] > 14:
+                    mask[i] = False
+                    continue 
                 
-                    # Protect the CMD FIFO
-                    if hw_sd["cmd"] > 14:
-                        mask[i] = False
-                        continue 
-                    
-                    # Protect ALL 4 LIT Banks based on their unbalanced physical depths (24, 24, 18, 12)
-                    if (hw_sd["lit1"] > 24 or 
-                        hw_sd["lit2"] > 24 or 
-                        hw_sd["lit3"] > 18 or 
-                        hw_sd["lit4"] > 12):
-                        mask[i] = False
-                        continue
-                elif i == 8:
-                    if self.hw_state.get("bypass_fifo_count", 0) + min(BYPASS_ROWS_PER_BEAT, len(self.cmds[8])) > BYPASS_FIFO_SIZE:
-                        mask[8] = False
+                # Protect ALL 4 LIT Banks based on their unbalanced physical depths (24, 24, 18, 12)
+                if (hw_sd["lit1"] > 24 or 
+                    hw_sd["lit2"] > 24 or 
+                    hw_sd["lit3"] > 18 or 
+                    hw_sd["lit4"] > 12):
+                    mask[i] = False
+                    continue
                 
         if not work_remaining or not mask[:NUM_DECODERS].any():
             mask[NO_OP_ACTION] = True
@@ -457,35 +437,25 @@ class DecoderEnvXSim(gym.Env):
             action_dest = 0
         else:
             action_dest = int(action)
+            # Regular lanes: greedy packing of whole command groups into 16-bit slots.
+            while slots_used < BEATS_ON_BUS and self.cmds[action_dest]:
+                raw_cmd = self.cmds[action_dest][0]
+                _, needed = decode_token_slots(raw_cmd)
 
-            if action_dest == 8:
-                # Bypass: whole 56-bit rows, BYPASS_ROWS_PER_BEAT per beat, one lane each.
-                while commands_packed < BYPASS_ROWS_PER_BEAT and self.cmds[8]:
-                    row = self.cmds[8].popleft() & ((1 << BYPASS_ROW_BITS) - 1)
-                    payload_128b |= row << (commands_packed * BYPASS_LANE_BITS)
-                    commands_packed += 1
+                if slots_used + needed > BEATS_ON_BUS:
+                    break
+                if needed > len(self.cmds[action_dest]):
+                    break
+
+                # The group fits perfectly. Safely pop and pack it into the payload.
+                for _ in range(needed):
+                    token = self.cmds[action_dest].popleft()
+                    clean_16b_token = token & 0xFFFF
+                    payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
                     slots_used += 1
-                    self.n_sent[8] += 1
-            else:
-                # Regular lanes: greedy packing of whole command groups into 16-bit slots.
-                while slots_used < BEATS_ON_BUS and self.cmds[action_dest]:
-                    raw_cmd = self.cmds[action_dest][0]
-                    _, needed = decode_token_slots(raw_cmd)
 
-                    if slots_used + needed > BEATS_ON_BUS:
-                        break
-                    if needed > len(self.cmds[action_dest]):
-                        break
-
-                    # The group fits perfectly. Safely pop and pack it into the payload.
-                    for _ in range(needed):
-                        token = self.cmds[action_dest].popleft()
-                        clean_16b_token = token & 0xFFFF
-                        payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
-                        slots_used += 1
-
-                    commands_packed += 1
-                    self.n_sent[action_dest] += 1
+                commands_packed += 1
+                self.n_sent[action_dest] += 1
 
             if commands_packed == 0:
                 valid_bit = 0   # never send an empty beat flagged valid
@@ -543,7 +513,6 @@ class DecoderEnvXSim(gym.Env):
             sub_decoders = self.hw_state.get("sub_decoders", [])
             hw_clear = (
                 self.hw_state.get("top_row_valid", 0) == 0
-                and self.hw_state.get("bypass_fifo_count", 0) == 0
                 and len(sub_decoders) == 8
                 and all(
                     decoder["cmd"] == 0
@@ -593,10 +562,6 @@ class DecoderEnvXSim(gym.Env):
             "cmd_fifo_fill": np.zeros(8, dtype=np.float32),
             "lit_fifo_fill": np.zeros(8, dtype=np.float32),
             "output_fifo_fill": np.zeros(8, dtype=np.float32),
-            "bypass_fifo_fill": np.array(
-                [self.hw_state.get("bypass_fifo_count", 0) / BYPASS_FIFO_SIZE],
-                dtype=np.float32,
-            ),
             "lookahead_types": np.zeros((NUM_DECODERS, LOOKAHEAD_WINDOW, 4), dtype=np.int32),
             "global_progress": np.array([0.0], dtype=np.float32),
             "cycles_left": np.zeros(NUM_DECODERS, dtype=np.float32),
@@ -606,11 +571,10 @@ class DecoderEnvXSim(gym.Env):
         }
 
         for i in range(NUM_DECODERS):
-            is_bypass = (i == 8)
             bus_queue = self.cmds[i]
             
             if len(bus_queue) > 0:
-                head_info = self._decode_token(bus_queue[0], is_bypass)
+                head_info = self._decode_token(bus_queue[0])
                 obs["cycles_left"][i] = min(head_info["cycles"] / MAX_CYCLES_LEFT, 1.0)
             else:
                 obs["cycles_left"][i] = 0.0
@@ -618,7 +582,7 @@ class DecoderEnvXSim(gym.Env):
             window_size = min(len(bus_queue), LOOKAHEAD_WINDOW)
             for j in range(window_size):
                 raw_token = bus_queue[j]
-                token_info = self._decode_token(raw_token, is_bypass) 
+                token_info = self._decode_token(raw_token) 
                 
                 obs["lookahead_cycles"][i, j] = min(token_info["cycles"] / MAX_CYCLES_LEFT, 1.0)
                 obs["lookahead_is_barrier"][i, j] = float(token_info["is_barrier"])

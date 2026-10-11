@@ -36,7 +36,7 @@ class HwEpisodeStatsCallback(BaseCallback):
         self.episode_count = 0
         self.deadlock_count = 0
         self.mismatch_count = 0
-        self.action_counts = np.zeros(10) # 0-7 Regular, 8 Bypass, 9 No-Op
+        self.action_counts = np.zeros(9) # 0-7 Regular, 8 No-Op
         
     def _init_callback(self):
         if not os.path.exists(self.log_file):
@@ -50,9 +50,9 @@ class HwEpisodeStatsCallback(BaseCallback):
         if self.num_timesteps % 2048 == 0:
             total_actions = np.sum(self.action_counts)
             if total_actions > 0:
-                for i in range(10):
+                for i in range(9):
                     pct = (self.action_counts[i] / total_actions) * 100
-                    action_name = "no_op" if i == 9 else f"decoder_{i}"
+                    action_name = "no_op" if i == 8 else f"decoder_{i}"
                     self.logger.record(f"exploration/{action_name}_pct", pct)
 
         infos = self.locals.get("infos", [])
@@ -94,7 +94,7 @@ class HwEpisodeStatsCallback(BaseCallback):
                 if self.episode_count % 10 == 0: # Print more frequently since HW episodes are slower
                     print(f"\nStep {self.num_timesteps} | HW Episode {self.episode_count}")
                     print(f"   Makespan (Cycles): {makespan} | Reward: {episode_reward:.3f} | Images Completed: {images_completed} | Deadlock: {is_deadlock} | Mismatch: {is_mismatch}")
-                    self.action_counts = np.zeros(10)
+                    self.action_counts = np.zeros(9)
         return True
 
 def main():
