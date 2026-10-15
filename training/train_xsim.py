@@ -17,7 +17,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 # Import the Hardware Environment
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from envs.decoder_env_xsim import DecoderEnvXSim, NUM_DECODERS
+from envs.decoder_env_xsim import DecoderEnvXSim, EXT_OBS_KEYS, NUM_DECODERS
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
     def func(progress_remaining: float) -> float:
@@ -47,6 +47,30 @@ class HwEpisodeStatsCallback(BaseCallback):
         actions = self.locals["actions"][0]
         self.action_counts[actions] += 1
 
+        hw_states = self.training_env.get_attr("hw_state")
+        for hw_state in hw_states:
+            for key in EXT_OBS_KEYS:
+                if key not in hw_state:
+                    continue
+
+                value = np.asarray(hw_state[key])
+                if value.ndim == 0:
+                    self.logger.record(key, float(value))
+                else:
+                    for lane, lane_value in enumerate(value):
+                        self.logger.record(f"{key}_{lane}", float(lane_value))
+
+        no_op_counts = self.training_env.get_attr("no_op_reason_counts")
+        for reason in (
+            "top_in_not_ready",
+            "no_valid_subdecoder_actions",
+            "chosen_while_actions_valid",
+        ):
+            self.logger.record(
+                f"no_op_reasons/{reason}",
+                sum(counts[reason] for counts in no_op_counts),
+            )
+
         if self.num_timesteps % 2048 == 0:
             total_actions = np.sum(self.action_counts)
             if total_actions > 0:
@@ -73,12 +97,12 @@ class HwEpisodeStatsCallback(BaseCallback):
                     print(f"[Callback] Total Deadlocks: {self.deadlock_count}, Total Mismatches: {self.mismatch_count}")
                     exit(1)
                 
-                self.logger.record("hardware/cycle_makespan", makespan)
-                self.logger.record("hardware/images_completed", int(images_completed))
-                self.logger.record("hardware/deadlocks", int(is_deadlock))
-                self.logger.record("hardware/deadlock_count", self.deadlock_count)
-                self.logger.record("hardware/mismatches", int(is_mismatch))
-                self.logger.record("hardware/mismatch_count", self.mismatch_count)
+                self.logger.record("cycle_makespan", makespan)
+                self.logger.record("images_completed", int(images_completed))
+                self.logger.record("deadlocks", int(is_deadlock))
+                self.logger.record("deadlock_count", self.deadlock_count)
+                self.logger.record("mismatches", int(is_mismatch))
+                self.logger.record("mismatch_count", self.mismatch_count)
                 sample_name = info.get("sample_name")
                 if sample_name:
                     sample_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_name).strip("._")
@@ -121,7 +145,7 @@ def main():
     print("Initializing Vivado Hardware-in-the-Loop Environment...")
     def make_env():
         env = DecoderEnvXSim(data_dir=args.data_dir, sim_dir=args.sim_dir)
-        env = ActionMasker(env, mask_fn) 
+        env = ActionMasker(env, mask_fn)
         return Monitor(env)
 
     vec_env = DummyVecEnv([make_env])

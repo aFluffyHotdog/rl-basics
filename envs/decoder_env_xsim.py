@@ -2,6 +2,7 @@
 Hardware-in-the-Loop Environment for the T8 Decompressor.
 Uses Tcl-Ping-Pong to step a live Vivado SystemVerilog simulation.
 """
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -36,7 +37,20 @@ GAMMA = 0.999
 LAG_MARGIN = 2        # rows of output spread tolerated before the lag term kicks in
 C_LAG = 4.0           # cycles of "virtual lost time" per squared excess row
 FAIL_PENALTY = 2.0    # terminal penalty (in lb0 units) for mismatch / deadlock
-DEBUG_CHECKS = True   # assert LB invariants every step; switch off for long runs
+DEBUG_CHECKS = True   # assert LB / CMD-accounting invariants every step; switch off for long runs
+
+# Extended @OBS fields appended by tb_interactive.sv (after the original 51):
+#   51..58 tail_busy[8] | 59..66 cmd_popped[8] | 67 rows_out | 68 rows_consumed | 69 lane_mismatches
+#   70 proto_err | 71 tailbusy_hits | 72 cmd_overcommit | 73 ready_viol
+EXT_OBS_LEN = 74
+EXT_OBS_KEYS = ("tail_busy", "cmd_popped", "rows_out", "rows_consumed", "lane_mismatches",
+                "proto_err", "tailbusy_hits", "cmd_overcommit", "ready_viol")
+# Testbench counters that must stay at 0 now that the mask enforces the same gates.
+# An increase means the mask / packer disagrees with the RTL -> the episode is failed.
+TB_VIOLATION_KEYS = ("proto_err", "cmd_overcommit", "ready_viol", "tailbusy_hits")
+# Per-lane golden mismatches are opt-in: the old testbench flagged free-run (barrier off) lane
+# mismatches as a measurement artifact, so they are only logged unless you turn this on.
+FAIL_ON_LANE_MISMATCH = False
 
 
 def decode_token_slots(token: int) -> tuple[str, int]:
@@ -122,6 +136,12 @@ class DecoderEnvXSim(gym.Env):
 
         self.sim_proc = None
         self.hw_state = {"top_in_ready": 1, "top_row_valid": 0, "mismatches": 0}
+        self.no_op_reason_counts = {
+            "top_in_not_ready": 0,
+            "no_valid_subdecoder_actions": 0,
+            "chosen_while_actions_valid": 0,
+        }
+        self.top_not_ready_log_path = Path("top_not_ready_fifo_states.json")
         self.completed_images = 0
         self.episodes_since_vivado_restart = 0
         self.max_episodes_per_vivado_process = 100
@@ -244,79 +264,113 @@ class DecoderEnvXSim(gym.Env):
                 "out": int(parts[idx+5])
             })
             idx += 6
+
+        # Extended fields (testbench with arbiter / flow-control checks). Older testbenches stop at 51.
+        if len(parts) >= EXT_OBS_LEN:
+            self.hw_state["tail_busy"] = [int(x) for x in parts[51:59]]
+            self.hw_state["cmd_popped"] = [int(x) for x in parts[59:67]]
+            (self.hw_state["rows_out"], self.hw_state["rows_consumed"], self.hw_state["lane_mismatches"],
+             self.hw_state["proto_err"], self.hw_state["tailbusy_hits"], self.hw_state["cmd_overcommit"],
+             self.hw_state["ready_viol"]) = (int(x) for x in parts[67:74])
+        else:
+            for key in EXT_OBS_KEYS:
+                self.hw_state.pop(key, None)
+
+    def _log_top_not_ready_fifo_state(self, action: int):
+        if self.hw_state["top_in_ready"] != 0:
+            return
+
+        log_path = self.top_not_ready_log_path
+        events = {}
+        if log_path.exists():
+            with log_path.open("r", encoding="utf-8") as json_file:
+                events = json.load(json_file)
+            if not isinstance(events, dict):
+                raise ValueError(f"Expected a JSON object in {log_path}")
+
+        action_name = "no_op" if action == NO_OP_ACTION else f"decoder_{action}"
+        events[str(self.cycles)] = {
+            "action": action,
+            "action_name": action_name,
+            "top_in_ready": self.hw_state["top_in_ready"],
+            "top_row_valid": self.hw_state["top_row_valid"],
+            "mismatches": self.hw_state["mismatches"],
+            "subdecoders": [
+                {"subdecoder": decoder, **fifo_state}
+                for decoder, fifo_state in enumerate(self.hw_state["sub_decoders"])
+            ],
+        }
+        with log_path.open("w", encoding="utf-8") as json_file:
+            json.dump(events, json_file, indent=2)
+            json_file.write("\n")
         
-    def _entry_info(self, token):
-        """Mirror of the old SubDecoder timing: (is_cmd_fifo_entry, ticks, swallows_next_entry)."""
+    def _group_ticks(self, token) -> int:
+        """Estimated decode ticks of one command group, from its head token.
+
+        Old SubDecoder timing: 1 start tick + `cycles`. A group is one command word (CMD with its
+        LITs, or RLE with its pattern word) = one CMD-FIFO entry in the RTL, which is also what
+        cmd_popped counts. A stray LIT/SEED head carries no command of its own (cost 0).
+        """
         t = int(token); payload = t & 0xFFFF; type_code = (t >> 16) & 0xF
-        if type_code == LIT_TYPE:
-            return False, 0, False                      # goes to the literal FIFO
-        if type_code not in (CMD_TYPE, LIT_TYPE, RLE_TYPE):
-            return True, 1, False                       # SEED entry: cycles=0 -> 1 start tick
+        if type_code not in (CMD_TYPE, RLE_TYPE):
+            return 0
         is_rle = (type_code == RLE_TYPE) or (type_code == CMD_TYPE and ((payload >> 15) & 1) == 1)
         if is_rle:
             cycles = 2 if ((payload >> 11) & 0xF) > 7 else 1
-            return True, cycles + 1, ((payload >> 8) & 0x7) == 7   # period_class 7 swallows next entry
-        lit_field = (payload >> 11) & 0xF
-        cycles = (lit_field // 4) + (1 if lit_field % 4 else 0) if lit_field >= 4 else 1
-        return True, cycles + 1, False
+        else:
+            lit_field = (payload >> 11) & 0xF
+            cycles = (lit_field // 4) + (1 if lit_field % 4 else 0) if lit_field >= 4 else 1
+        return cycles + 1
 
     def _build_lb_tables(self):
-        """Call in reset() after self.cmds is loaded, before any pops."""
-        self.bus_after, self.entries_upto, self.work_prefix = [], [], []
+        """Call in reset() after self.cmds is loaded, before any pops. Everything is indexed by GROUP."""
+        self.bus_after, self.work_prefix, self.groups_total = [], [], []
         for i, q in enumerate(self.cmds):
             toks = list(q)
-            cap = BEATS_ON_BUS   # items one beat can carry
-            needs, ent_per_group, costs = [], [], []
-            pos, swallow = 0, False
+            needs, costs = [], []
+            pos = 0
             while pos < len(toks):
                 need = decode_token_slots(toks[pos])[1]
-                if need > cap:
+                if need > BEATS_ON_BUS:
                     raise ValueError(f"queue {i}: group of {need} slots can never fit on the bus")
                 need = min(need, len(toks) - pos)
-                n_ent = 0
-                for t in toks[pos:pos + need]:
-                    is_entry, ticks, sw = self._entry_info(t)
-                    if not is_entry:
-                        continue
-                    n_ent += 1
-                    if swallow:
-                        costs.append(0); swallow = False         # entry swallowed by the previous RLE
-                    else:
-                        costs.append(ticks); swallow = sw
-                needs.append(need); ent_per_group.append(n_ent)
+                needs.append(need)
+                costs.append(self._group_ticks(toks[pos]))
                 pos += need
 
             G = len(needs)
-            ba = np.zeros(G + 1, dtype=np.int64)                 # beats needed from group g onward
+            ba = np.zeros(G + 1, dtype=np.int64)                 # min beats needed from group g onward
             for g in range(G - 1, -1, -1):
                 used, k = 0, 0
-                while g + k < G and used + needs[g + k] <= cap:
+                while g + k < G and used + needs[g + k] <= BEATS_ON_BUS:
                     used += needs[g + k]; k += 1
                 ba[g] = 1 + ba[g + k]
             self.bus_after.append(ba)
-            self.entries_upto.append(np.concatenate([[0], np.cumsum(ent_per_group)]).astype(np.int64))
             self.work_prefix.append(np.concatenate([[0], np.cumsum(costs)]).astype(np.int64))
+            self.groups_total.append(G)
 
         self.n_sent = [0] * NUM_DECODERS      # groups sent per queue
-        self.consumed = [0] * NUM_DECODERS    # cmd-FIFO entries that have left the FIFO
+        self.consumed = [0] * NUM_DECODERS    # groups whose CMD has been popped from the RTL FIFO
 
         # initial-bound diagnostics: which term sets lb0?
-        lanes = 8
         work0 = [int(wp[-1]) for wp in self.work_prefix]
         self.bus0 = int(sum(int(ba[0]) for ba in self.bus_after))
-        self.work0_max = max(work0[:lanes])
-        self.work0_lane = int(np.argmax(work0[:lanes]))
+        self.work0_max = max(work0)
+        self.work0_lane = int(np.argmax(work0))
 
     def _compute_lb(self) -> int:
         """Call exactly once per step, after hw_state is parsed."""
         sd = self.hw_state.get("sub_decoders", [])
+        popped = self.hw_state.get("cmd_popped")
         bus = sum(int(self.bus_after[i][self.n_sent[i]]) for i in range(NUM_DECODERS))
 
         work_max = 0
-        for i in range(8):
-            in_fifo = sd[i]["cmd"] if i < len(sd) else 0
-            sent = int(self.entries_upto[i][self.n_sent[i]])
-            c = min(max(self.consumed[i], sent - in_fifo), sent)  # monotone, never above entries sent
+        for i in range(NUM_DECODERS):
+            if popped is not None:
+                c = popped[i]                                     # exact: pops reported by the RTL
+            else:
+                c = self.n_sent[i] - (sd[i]["cmd"] if i < len(sd) else 0)   # older testbench: infer
+            c = min(max(self.consumed[i], c), self.n_sent[i])     # monotone, never above groups sent
             self.consumed[i] = c
             work_max = max(work_max, int(self.work_prefix[i][-1] - self.work_prefix[i][c]))
 
@@ -324,7 +378,8 @@ class DecoderEnvXSim(gym.Env):
         return max(bus, work_max)
 
     def _lag_excess(self) -> int:
-        """Rows by which the output spread exceeds LAG_MARGIN, over lanes that are still active.
+        """
+        Number of rows by which the output spread exceeds LAG_MARGIN, over lanes that are still active.
 
         A lane that has sent everything and fully drained no longer takes part in the row
         synchronization, so it is excluded (otherwise a finished lane at out=0 looks like lag).
@@ -345,46 +400,89 @@ class DecoderEnvXSim(gym.Env):
         """Potential in cycles. Takes lb as an argument so _compute_lb() runs once per step."""
         return -(float(lb) + C_LAG * self._lag_excess() ** 2)
 
-    def _fail(self, *, deadlock=False, mismatch=False):
-        """Failure terminal. No shaping term here: using Phi(terminal)=0 on a failure would pay the
-        agent the whole remaining potential for crashing. The penalty exceeds any progress credit
-        already earned, so failing is always worse than finishing."""
+    def _fail(self, *, deadlock=False, mismatch=False, violation=None):
+        """Special reward calculation when a violation occurs.
+        This penalty is designed to be worse than finishing an episode
+        """
         lb_now = self._compute_lb()
         reward = -(FAIL_PENALTY + lb_now / self.lb0)
-        return self._get_obs(), reward, True, False, {"deadlock": deadlock, "mismatch": mismatch}
+        info = {"deadlock": deadlock, "mismatch": mismatch, "violation": violation}
+        return self._get_obs(), reward, True, False, info
+
+    # --flow control--
+    def _cmd_inflight(self, i: int) -> int:
+        """Commands sent to lane i and not yet popped from its CMD FIFO.
+
+        Counts commands still travelling through the arbiter FIFO / tail / sub_rx 
+        Falls back to occupancy if the testbench is the older one.
+        """
+        popped = self.hw_state.get("cmd_popped")
+        if popped is not None:
+            return self.n_sent[i] - popped[i]
+        return self.hw_state["sub_decoders"][i]["cmd"]
+
+    def _plan_beat(self, i: int) -> tuple[int, int, int]:
+        """
+        Checks a lane's status and returns how many cmds it can fit
+
+        action_masks() enables a lane iff this packs at least one group,
+        and step() packs exactly what this returns
+        """
+        q = self.cmds[i]
+        sd = self.hw_state["sub_decoders"][i]
+        inflight = self._cmd_inflight(i)
+        groups = pos = slots = pending_lits = 0
+
+        while pos < len(q) and slots < BEATS_ON_BUS:
+            _, needed = decode_token_slots(q[pos])
+            if slots + needed > BEATS_ON_BUS:
+                break
+            if needed > len(q) - pos:
+                break
+            if inflight + groups + 1 > CMD_FIFO_SIZE:
+                break
+            group_lits = sum(((int(q[pos + k]) >> 16) & 0xF) == LIT_TYPE for k in range(needed))
+            if any(
+                sd[f"lit{bank}"] + pending_lits + group_lits > capacity
+                for bank, capacity in enumerate(LIT_FIFO_CAPACITIES, start=1)
+            ):
+                break
+            slots += needed
+            pos += needed
+            pending_lits += group_lits
+            groups += 1
+        return groups, pos, slots
+
+    def _delta(self, key: str) -> int:
+        """Testbench counter change since reset (the sim restarts, but don't rely on it)."""
+        return self.hw_state.get(key, 0) - self._chk_base.get(key, 0)
+
+    def _check_tb_counters(self):
+        """Return the name of the first testbench violation counter that has increased, else None."""
+        for key in TB_VIOLATION_KEYS:
+            if self._delta(key) > 0:
+                return key
+        return None
 
     def action_masks(self) -> np.ndarray:
-        mask = np.zeros(9, dtype=bool)
-        
-        # If hardware is stalled, all routes are blocked except Yield (No-Op)
+        mask = np.zeros(NUM_DECODERS + 1, dtype=bool)
+
+        # If the arbiter input FIFO is almost full, all routes are blocked except Yield (No-Op)
         if self.hw_state.get("top_in_ready", 0) == 0:
             mask[NO_OP_ACTION] = True
             return mask
-            
-        # Check FIFO banks
-        work_remaining = False
-        for i in range(NUM_DECODERS):
-            if len(self.cmds[i]) > 0:
-                mask[i] = True
-                work_remaining = True
 
-                # check the state of FIFO for sub-decoders
-                hw_sd = self.hw_state["sub_decoders"][i]
-            
-                # Protect the CMD FIFO
-                if hw_sd["cmd"] > 14:
-                    mask[i] = False
-                    continue 
-                
-                # Protect ALL 4 LIT Banks based on their unbalanced physical depths (24, 24, 18, 12)
-                if (hw_sd["lit1"] > 24 or 
-                    hw_sd["lit2"] > 24 or 
-                    hw_sd["lit3"] > 18 or 
-                    hw_sd["lit4"] > 12):
-                    mask[i] = False
-                    continue
-                
-        if not work_remaining or not mask[:NUM_DECODERS].any():
+        tail_busy = self.hw_state.get("tail_busy")
+        for i in range(NUM_DECODERS):
+            if not self.cmds[i]:
+                continue
+            # Mask out a lane if its tail is busy (arbiter FIFO full)
+            if tail_busy is not None and tail_busy[i]:
+                continue
+            groups, _, _ = self._plan_beat(i)
+            mask[i] = groups > 0
+
+        if not mask[:NUM_DECODERS].any():
             mask[NO_OP_ACTION] = True
         return mask
 
@@ -417,6 +515,9 @@ class DecoderEnvXSim(gym.Env):
         self._resume_sim()
         self._wait_for_obs()
 
+        # Testbench violation counters start from whatever the sim reports right after init.
+        self._chk_base = {k: self.hw_state.get(k, 0) for k in TB_VIOLATION_KEYS + ("lane_mismatches",)}
+
         self._build_lb_tables()
         self.lb_prev = self._compute_lb()
         self.lb0 = max(self.lb_prev, 1)
@@ -432,37 +533,34 @@ class DecoderEnvXSim(gym.Env):
         slots_used = 0
         commands_packed = 0
 
-        if int(action) == NO_OP_ACTION:
+        if action == NO_OP_ACTION:
+            if self.hw_state.get("top_in_ready", 0) == 0:
+                reason = "top_in_not_ready"
+            elif not self.action_masks()[:NUM_DECODERS].any():
+                reason = "no_valid_subdecoder_actions"
+            else:
+                reason = "chosen_while_actions_valid"
+            self.no_op_reason_counts[reason] += 1
             valid_bit = 0
-            action_dest = 0
+            action_dest = NO_OP_ACTION
         else:
-            action_dest = int(action)
-            # Regular lanes: greedy packing of whole command groups into 16-bit slots.
-            while slots_used < BEATS_ON_BUS and self.cmds[action_dest]:
-                raw_cmd = self.cmds[action_dest][0]
-                _, needed = decode_token_slots(raw_cmd)
-
-                if slots_used + needed > BEATS_ON_BUS:
-                    break
-                if needed > len(self.cmds[action_dest]):
-                    break
-
-                # The group fits perfectly. Safely pop and pack it into the payload.
-                for _ in range(needed):
-                    token = self.cmds[action_dest].popleft()
-                    clean_16b_token = token & 0xFFFF
-                    payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
-                    slots_used += 1
-
-                commands_packed += 1
-                self.n_sent[action_dest] += 1
+            action_dest = action
+            # Regular lanes: whole command groups packed into 16-bit slots, exactly as planned.
+            groups, n_tokens, _ = self._plan_beat(action_dest)
+            for _ in range(n_tokens):
+                token = self.cmds[action_dest].popleft()
+                clean_16b_token = token & 0xFFFF
+                payload_128b = payload_128b | (clean_16b_token << (slots_used * 16))
+                slots_used += 1
+            commands_packed = groups
+            self.n_sent[action_dest] += groups
 
             if commands_packed == 0:
                 valid_bit = 0   # never send an empty beat flagged valid
 
         dest_bin = f"{action_dest:04b}"
 
-        if action_dest == 8 or commands_packed == 0:
+        if action_dest == NO_OP_ACTION or commands_packed == 0:
             ncmd_bin = "000"
         else:
             ncmd_bin = f"{commands_packed - 1:03b}"
@@ -491,9 +589,22 @@ class DecoderEnvXSim(gym.Env):
             else:
                 print(f"[Env] current subdecoder {action_dest}: unavailable")
 
-        # --- failure terminals (no shaping on these steps) ---
-        if self.hw_state["mismatches"] > 0:
-            print(f"[Env] Hardware Mismatch Detected! Total Mismatches: {self.hw_state['mismatches']}")
+        # reset logic when we detect a violation / failure
+        violation = self._check_tb_counters()
+        if violation:
+            print(f"[Env] Testbench check failed: {violation} (+{self._delta(violation)}) "
+                  f"action={action} action_hex={action_hex}")
+            return self._fail(violation=violation)
+
+        if DEBUG_CHECKS and "cmd_popped" in self.hw_state:
+            for i in range(NUM_DECODERS):
+                assert self.hw_state["cmd_popped"][i] <= self.n_sent[i], (
+                    f"lane {i}: RTL popped {self.hw_state['cmd_popped'][i]} CMDs but only "
+                    f"{self.n_sent[i]} groups were sent -- group != CMD-FIFO entry, check the unit")
+
+        if self.hw_state["mismatches"] > 0 or (FAIL_ON_LANE_MISMATCH and self._delta("lane_mismatches") > 0):
+            print(f"[Env] Hardware Mismatch Detected! Total Mismatches: {self.hw_state['mismatches']}, "
+                  f"lane mismatches since reset: {self._delta('lane_mismatches')}")
             print(f"[Env] action_hex: {action_hex}")
             return self._fail(mismatch=True)
 
@@ -535,6 +646,9 @@ class DecoderEnvXSim(gym.Env):
             assert lb_new <= self.lb_prev, f"lower bound increased: {self.lb_prev} -> {lb_new}"
             if terminated:
                 assert lb_new == 0, f"episode finished but lb={lb_new} (parts: {self.lb_parts})"
+                if "cmd_popped" in self.hw_state:
+                    assert self.hw_state["cmd_popped"] == self.n_sent, (
+                        f"drained but RTL pops {self.hw_state['cmd_popped']} != groups sent {self.n_sent}")
         phi_new = 0.0 if terminated else self._phi(lb_new)
         reward = (-1.0 + GAMMA * phi_new - self.phi_prev) / self.lb0
         self.phi_prev = phi_new
@@ -550,6 +664,11 @@ class DecoderEnvXSim(gym.Env):
                 "lb_bus0": self.bus0,
                 "lb_work0": self.work0_max,
                 "lb_work0_lane": self.work0_lane,
+                "lane_mismatches": self._delta("lane_mismatches"),
+                "tailbusy_hits": self._delta("tailbusy_hits"),
+                "cmd_overcommit": self._delta("cmd_overcommit"),
+                "proto_err": self._delta("proto_err"),
+                "ready_viol": self._delta("ready_viol"),
             }
 
         return self._get_obs(), reward, terminated, False, info
@@ -608,10 +727,7 @@ class DecoderEnvXSim(gym.Env):
         for i in range(NUM_DECODERS):
             window_size = min(len(self.cmds[i]), LOOKAHEAD_WINDOW)
             for j in range(window_size):
-                if i == 8:
-                    category = "CMD"
-                else:
-                    category, _ = decode_token_slots(self.cmds[i][j])
+                category, _ = decode_token_slots(self.cmds[i][j])
                 type_index = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}[category]
                 obs["lookahead_types"][i, j, type_index] = 1
                     
