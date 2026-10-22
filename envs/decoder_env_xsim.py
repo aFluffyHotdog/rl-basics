@@ -31,7 +31,7 @@ CMD_TYPE=0
 LIT_TYPE=1
 RLE_TYPE=2
 
-GAMMA = 0.999
+GAMMA = 1.0
 
 # Potential-based reward shaping: Phi(s) = -(LB(s) + C_LAG * lag_excess(s)^2), in cycles
 LAG_MARGIN = 2        # rows of output spread tolerated before the lag term kicks in
@@ -132,10 +132,17 @@ class DecoderEnvXSim(gym.Env):
             "lookahead_cycles": gym.spaces.Box(low=-1.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.float32),
             "lookahead_is_barrier": gym.spaces.Box(low=-1.0, high=1.0, shape=(NUM_DECODERS, LOOKAHEAD_WINDOW), dtype=np.int32),
             "channel_skew": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            # Why a lane is (un)available .
+            "tail_busy": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            "cmd_inflight": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS,), dtype=np.float32),
+            "action_mask": gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_DECODERS + 1,), dtype=np.float32),
         })
 
         self.sim_proc = None
         self.hw_state = {"top_in_ready": 1, "top_row_valid": 0, "mismatches": 0}
+        # The action mask is needed twice per step (observation + MaskablePPO). It only depends on
+        # hw_state and the pending queues, so it is computed once per state and then reused.
+        self._mask_cache = None
         self.no_op_reason_counts = {
             "top_in_not_ready": 0,
             "no_valid_subdecoder_actions": 0,
@@ -247,6 +254,7 @@ class DecoderEnvXSim(gym.Env):
 
     def _parse_obs(self, obs_str: str):
         """Parses the minimum required physical signals from XSIM."""
+        self._mask_cache = None   # hardware state changed -> recompute mask / mask observation
         parts = obs_str.split()[1:]
         self.hw_state["top_in_ready"] = int(parts[0])
         self.hw_state["top_row_valid"] = int(parts[1])
@@ -378,8 +386,7 @@ class DecoderEnvXSim(gym.Env):
         return max(bus, work_max)
 
     def _lag_excess(self) -> int:
-        """
-        Number of rows by which the output spread exceeds LAG_MARGIN, over lanes that are still active.
+        """Rows by which the output spread exceeds LAG_MARGIN, over lanes that are still active.
 
         A lane that has sent everything and fully drained no longer takes part in the row
         synchronization, so it is excluded (otherwise a finished lane at out=0 looks like lag).
@@ -401,20 +408,20 @@ class DecoderEnvXSim(gym.Env):
         return -(float(lb) + C_LAG * self._lag_excess() ** 2)
 
     def _fail(self, *, deadlock=False, mismatch=False, violation=None):
-        """Special reward calculation when a violation occurs.
-        This penalty is designed to be worse than finishing an episode
-        """
+        """Failure terminal. No shaping term here: using Phi(terminal)=0 on a failure would pay the
+        agent the whole remaining potential for crashing. The penalty exceeds any progress credit
+        already earned, so failing is always worse than finishing."""
         lb_now = self._compute_lb()
         reward = -(FAIL_PENALTY + lb_now / self.lb0)
         info = {"deadlock": deadlock, "mismatch": mismatch, "violation": violation}
         return self._get_obs(), reward, True, False, info
 
-    # --flow control--
+    # ------------------------------------------------------------------ flow control
     def _cmd_inflight(self, i: int) -> int:
         """Commands sent to lane i and not yet popped from its CMD FIFO.
 
-        Counts commands still travelling through the arbiter FIFO / tail / sub_rx 
-        Falls back to occupancy if the testbench is the older one.
+        Counts commands still travelling through the arbiter FIFO / tail / sub_rx, which FIFO
+        occupancy alone cannot see. Falls back to occupancy if the testbench is the older one.
         """
         popped = self.hw_state.get("cmd_popped")
         if popped is not None:
@@ -422,11 +429,16 @@ class DecoderEnvXSim(gym.Env):
         return self.hw_state["sub_decoders"][i]["cmd"]
 
     def _plan_beat(self, i: int) -> tuple[int, int, int]:
-        """
-        Checks a lane's status and returns how many cmds it can fit
+        """Dry run of the packer for lane i -> (groups, tokens, slots) the next beat would carry.
 
-        action_masks() enables a lane iff this packs at least one group,
-        and step() packs exactly what this returns
+        Single source of truth: action_masks() enables a lane iff this packs at least one group,
+        and step() packs exactly what this returns, so the mask can never offer an action that
+        silently sends nothing.
+
+        Return Values:
+         - groups: no. of whole commands a beat carries
+         - tokens: how many items are popped from a lane's queue
+         - slots: no. of slots it will use on the bus
         """
         q = self.cmds[i]
         sd = self.hw_state["sub_decoders"][i]
@@ -465,6 +477,11 @@ class DecoderEnvXSim(gym.Env):
         return None
 
     def action_masks(self) -> np.ndarray:
+        if self._mask_cache is None:
+            self._mask_cache = self._compute_action_mask()
+        return self._mask_cache.copy()
+
+    def _compute_action_mask(self) -> np.ndarray:
         mask = np.zeros(NUM_DECODERS + 1, dtype=bool)
 
         # If the arbiter input FIFO is almost full, all routes are blocked except Yield (No-Op)
@@ -476,7 +493,8 @@ class DecoderEnvXSim(gym.Env):
         for i in range(NUM_DECODERS):
             if not self.cmds[i]:
                 continue
-            # Mask out a lane if its tail is busy (arbiter FIFO full)
+            # The arbiter dispatches on tail_busy alone; a beat sent to a busy lane can sit at the
+            # head of its FIFO and block every beat behind it.
             if tail_busy is not None and tail_busy[i]:
                 continue
             groups, _, _ = self._plan_beat(i)
@@ -496,6 +514,7 @@ class DecoderEnvXSim(gym.Env):
         self.current_sample_name = str(selected_stem_path.relative_to(self.data_dir))
 
         self.cmds = [deque(list(queue)) for queue in selected_dataset]
+        self._mask_cache = None
         self.initial_tokens = sum(len(cmd) for cmd in self.cmds)
         self.cycles = 0
         self.stall_cycles = 0
@@ -527,6 +546,8 @@ class DecoderEnvXSim(gym.Env):
 
     def step(self, action):
         self.cycles += 1
+        action = int(action)
+        # self._log_top_not_ready_fifo_state(action)
 
         valid_bit = 1
         payload_128b = 0
@@ -557,6 +578,8 @@ class DecoderEnvXSim(gym.Env):
 
             if commands_packed == 0:
                 valid_bit = 0   # never send an empty beat flagged valid
+
+        self._mask_cache = None   # queues / n_sent changed
 
         dest_bin = f"{action_dest:04b}"
 
@@ -589,12 +612,13 @@ class DecoderEnvXSim(gym.Env):
             else:
                 print(f"[Env] current subdecoder {action_dest}: unavailable")
 
-        # reset logic when we detect a violation / failure
+        # --- failure terminals (no shaping on these steps) ---
+        # Testbench flow-control / format checks. The mask enforces the same gates, so any increase
+        # means the mask or packer disagrees with the RTL; the beat is already suspect.
         violation = self._check_tb_counters()
         if violation:
             print(f"[Env] Testbench check failed: {violation} (+{self._delta(violation)}) "
                   f"action={action} action_hex={action_hex}")
-            return self._fail(violation=violation)
 
         if DEBUG_CHECKS and "cmd_popped" in self.hw_state:
             for i in range(NUM_DECODERS):
@@ -606,7 +630,6 @@ class DecoderEnvXSim(gym.Env):
             print(f"[Env] Hardware Mismatch Detected! Total Mismatches: {self.hw_state['mismatches']}, "
                   f"lane mismatches since reset: {self._delta('lane_mismatches')}")
             print(f"[Env] action_hex: {action_hex}")
-            return self._fail(mismatch=True)
 
         if slots_used == 0 and any(len(q) > 0 for q in self.cmds):
             self.stall_cycles += 1
@@ -616,7 +639,7 @@ class DecoderEnvXSim(gym.Env):
         if self.stall_cycles > DEADLOCK_STALL_CYCLES:
             remaining_cmds = [len(q) for q in self.cmds]
             print(f"[Env] Deadlock detected: stall_cycles={self.stall_cycles}, remaining_cmds={remaining_cmds}")
-            return self._fail(deadlock=True)
+            return self._get_obs(), reward, True, False, info
 
         # --- completion ---
         terminated = False
@@ -687,6 +710,9 @@ class DecoderEnvXSim(gym.Env):
             "lookahead_cycles": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.float32), 
             "lookahead_is_barrier": np.full((NUM_DECODERS, LOOKAHEAD_WINDOW), -1, dtype=np.int32), 
             "channel_skew": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "tail_busy": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "cmd_inflight": np.zeros(NUM_DECODERS, dtype=np.float32),
+            "action_mask": np.zeros(NUM_DECODERS + 1, dtype=np.float32),
         }
 
         for i in range(NUM_DECODERS):
@@ -733,6 +759,16 @@ class DecoderEnvXSim(gym.Env):
                     
         total_remaining = sum(len(q) for q in self.cmds)
         obs["global_progress"][0] = total_remaining / max(1, self.initial_tokens)
+
+        # Flow-control state behind the mask. tail_busy needs the extended testbench (zeros otherwise);
+        # in-flight falls back to FIFO occupancy on the older testbench. Normalised by the CMD FIFO depth.
+        tail_busy = self.hw_state.get("tail_busy")
+        if tail_busy is not None:
+            obs["tail_busy"][:] = tail_busy
+        if "sub_decoders" in self.hw_state and hasattr(self, "n_sent"):
+            for i in range(NUM_DECODERS):
+                obs["cmd_inflight"][i] = min(max(self._cmd_inflight(i), 0) / CMD_FIFO_SIZE, 1.0)
+            obs["action_mask"][:] = self.action_masks()   # mask for the action about to be chosen
 
         return obs
 

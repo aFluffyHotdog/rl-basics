@@ -55,10 +55,13 @@ class HwEpisodeStatsCallback(BaseCallback):
 
                 value = np.asarray(hw_state[key])
                 if value.ndim == 0:
-                    self.logger.record(key, float(value))
+                    self.logger.record(f"hardware/state/{key}", float(value))
                 else:
                     for lane, lane_value in enumerate(value):
-                        self.logger.record(f"{key}_{lane}", float(lane_value))
+                        self.logger.record(
+                            f"hardware/state/{key}_{lane}",
+                            float(lane_value),
+                        )
 
         no_op_counts = self.training_env.get_attr("no_op_reason_counts")
         for reason in (
@@ -67,7 +70,7 @@ class HwEpisodeStatsCallback(BaseCallback):
             "chosen_while_actions_valid",
         ):
             self.logger.record(
-                f"no_op_reasons/{reason}",
+                f"actions/no_op_reasons/{reason}",
                 sum(counts[reason] for counts in no_op_counts),
             )
 
@@ -77,7 +80,7 @@ class HwEpisodeStatsCallback(BaseCallback):
                 for i in range(9):
                     pct = (self.action_counts[i] / total_actions) * 100
                     action_name = "no_op" if i == 8 else f"decoder_{i}"
-                    self.logger.record(f"exploration/{action_name}_pct", pct)
+                    self.logger.record(f"actions/selection_pct/{action_name}", pct)
 
         infos = self.locals.get("infos", [])
         for info in infos:
@@ -97,18 +100,27 @@ class HwEpisodeStatsCallback(BaseCallback):
                     print(f"[Callback] Total Deadlocks: {self.deadlock_count}, Total Mismatches: {self.mismatch_count}")
                     exit(1)
                 
-                self.logger.record("cycle_makespan", makespan)
-                self.logger.record("images_completed", int(images_completed))
-                self.logger.record("deadlocks", int(is_deadlock))
-                self.logger.record("deadlock_count", self.deadlock_count)
-                self.logger.record("mismatches", int(is_mismatch))
-                self.logger.record("mismatch_count", self.mismatch_count)
+                self.logger.record("hardware/episode/makespan_cycles", makespan)
+                self.logger.record(
+                    "hardware/episode/images_completed",
+                    int(images_completed),
+                )
+                self.logger.record("hardware/failures/deadlocks", int(is_deadlock))
+                self.logger.record(
+                    "hardware/failures/deadlock_count",
+                    self.deadlock_count,
+                )
+                self.logger.record("hardware/failures/mismatches", int(is_mismatch))
+                self.logger.record(
+                    "hardware/failures/mismatch_count",
+                    self.mismatch_count,
+                )
                 sample_name = info.get("sample_name")
                 if sample_name:
                     sample_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_name).strip("._")
                     if sample_tag:
                         self.logger.record(
-                            f"hardware/makespan_by_sample/{sample_tag}",
+                            f"hardware/samples/makespan/{sample_tag}",
                             makespan,
                         )
                 
@@ -149,7 +161,7 @@ def main():
         return Monitor(env)
 
     vec_env = DummyVecEnv([make_env])
-    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.999)
+    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=1.0)
 
     # --- 2. Callbacks Setup ---
     stats_cb = HwEpisodeStatsCallback(log_file)
@@ -176,7 +188,7 @@ def main():
             n_steps=16384,
             batch_size=2048,
             n_epochs=4,
-            gamma=0.999,
+            gamma=1.0,
             gae_lambda=0.97,
             ent_coef=0.01,
             target_kl=0.02,
