@@ -5,13 +5,14 @@ now implements:
 - Action chunking
 - Curriculum based learning
 """
+import math
+import random
+import numpy as np
+import gymnasium as gym
+
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
-import random
-
-import gymnasium as gym
-import numpy as np
 
 LIT_FIFO_SIZE = 72 # 24/24/18/12
 CMD_FIFO_SIZE = 16

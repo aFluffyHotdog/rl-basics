@@ -18,6 +18,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 # Import the Hardware Environment
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.decoder_env_xsim import DecoderEnvXSim, EXT_OBS_KEYS, NUM_DECODERS
+from agents.lane_extractor import LaneSharedExtractor
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
     def func(progress_remaining: float) -> float:
@@ -140,6 +141,8 @@ def main():
     ap.add_argument('--total_timesteps', type=int, default=60_000_000, help="Total training iterations")
     ap.add_argument('--save_freq', type=int, default=100_000, help="Save checkpoint every N steps")
     ap.add_argument('--resume_path', type=str, default=None, help="Path to checkpoint model to resume")
+    ap.add_argument('--obs_version', type=str, default="v2", choices=["v1", "v2"],
+                    help="v2 = compact per-lane features; v1 = token lookahead (for checkpoints trained before v2)")
     args = ap.parse_args()
 
     os.makedirs("logs", exist_ok=True)
@@ -156,7 +159,7 @@ def main():
     # to avoid Vivado file-lock collisions in xsim.dir!
     print("Initializing Vivado Hardware-in-the-Loop Environment...")
     def make_env():
-        env = DecoderEnvXSim(data_dir=args.data_dir, sim_dir=args.sim_dir)
+        env = DecoderEnvXSim(data_dir=args.data_dir, sim_dir=args.sim_dir, obs_version=args.obs_version)
         env = ActionMasker(env, mask_fn)
         return Monitor(env)
 
@@ -181,6 +184,8 @@ def main():
     else:
         print("Initializing new MaskablePPO Model for Hardware...")
         policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
+        if args.obs_version == "v2":
+            policy_kwargs["features_extractor_class"] = LaneSharedExtractor
         model = MaskablePPO(
             policy="MultiInputPolicy",
             env=vec_env,
