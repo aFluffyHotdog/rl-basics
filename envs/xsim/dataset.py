@@ -7,11 +7,11 @@ from .constants import NUM_DECODERS
 
 def load_hex_folder(cmd_path: Path) -> list:
     files = sorted(cmd_path.glob('*.hex'))
-    if len(files) != NUM_DECODERS:
+    if len(files) < NUM_DECODERS:
         raise ValueError(f"Expected {NUM_DECODERS} subdecoder hex files, found {len(files)}")
 
     outputs = []
-    for file_path in files:
+    for file_path in files[:NUM_DECODERS]:
         raw_lines = [line.strip() for line in file_path.read_text().splitlines() if line.strip()]
         outputs.append(deque(int(ln, 16) for ln in raw_lines))
     return outputs
