@@ -1,5 +1,6 @@
 logs/
 models/
+test data that i dont want to use/
 __pycache__/
 *.pyc
 *.pyo
