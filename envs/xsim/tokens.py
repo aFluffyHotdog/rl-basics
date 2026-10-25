@@ -1,7 +1,7 @@
 """Decoding of the subdecoder tokens (4-bit type above a 16-bit payload)."""
 from typing import NamedTuple
 
-from .constants import CMD_TYPE, LIT_TYPE, RLE_TYPE
+from .constants import CMD_TYPE, LIT_TYPE, RLE_TYPE, ROW_BYTES
 
 # One-hot index of each category in the "lookahead_types" observation.
 TYPE_INDEX = {"CMD": 0, "LIT": 1, "RLE": 2, "SEED": 3}
@@ -64,3 +64,29 @@ def group_ticks(token) -> int:
     if info.category not in ("CMD", "RLE"):
         return 0
     return info.cycles + 1
+
+
+def row_delta(token, row_ptr: int) -> tuple[int, int]:
+    """Rows closed by a group head token -> (rows_closed, new_row_ptr).
+
+    Output-byte model of cmd_disp.v: LC emits 2*lit_field + copy bytes (copy_len 0xF = none,
+    else copy_len+2), RLE emits rle_length+1; a row closes when the pointer reaches ROW_BYTES.
+    ROW_REPEAT (lit_field=0, copy_len=0xF) emits nothing and pushes K = (payload & 0x7F) + 1 rows.
+    LIT / pattern / SEED heads emit nothing.
+    """
+    t = int(token)
+    if (t >> 16) & 0xF != CMD_TYPE:
+        return 0, row_ptr
+    payload = t & 0xFFFF
+    if (payload >> 15) & 0x1:
+        out_bytes = ((payload >> 11) & 0xF) + 1
+    else:
+        lit_field = (payload >> 11) & 0xF
+        copy_len = (payload >> 7) & 0xF
+        if lit_field == 0 and copy_len == 0xF:
+            return (payload & 0x7F) + 1, row_ptr
+        out_bytes = 2 * lit_field + (0 if copy_len == 0xF else copy_len + 2)
+    row_ptr += out_bytes
+    if row_ptr >= ROW_BYTES:
+        return 1, 0
+    return 0, row_ptr

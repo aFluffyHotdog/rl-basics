@@ -14,11 +14,12 @@ from .constants import (
     EXT_OBS_KEYS,
     FAIL_ON_LANE_MISMATCH,
     FAIL_PENALTY,
-    GAMMA,
+    LAMBDA_T,
     NO_OP_ACTION,
     NO_OP_REASONS,
     NUM_ACTIONS,
     NUM_DECODERS,
+    NUM_ROWS,
     SUB_DECODER_FIELDS,
     TB_VIOLATION_KEYS,
     VIVADO_VERBOSE,
@@ -28,18 +29,21 @@ from .diagnostics import log_top_not_ready_fifo_state  # noqa: F401  (see commen
 from .flow_control import cmd_inflight, compute_action_mask, no_op_reason, plan_beat
 from .observation import build_observation, build_observation_space
 from .observation_v2 import build_observation_space_v2, build_observation_v2
+from .observation_v3 import build_observation_space_v3, build_observation_v3
 from .protocol import encode_beat, pack_payload, parse_obs_line
-from .reward import LowerBoundTracker, lag_excess, potential
+from .reward import LowerBoundTracker
+from .reward_v2 import reward_v2
 from .sim_client import XSimClient
 
 
-OBS_VERSIONS = ("v1", "v2")
+OBS_VERSIONS = ("v1", "v2", "v3")
 
 
 class DecoderEnvXSim(gym.Env):
-    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False, obs_version: str = "v2"):
-        """obs_version: "v2" = compact per-lane features (observation_v2.py);
-        "v1" = original token-level lookahead, needed to load models trained before v2."""
+    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False, obs_version: str = "v3"):
+        """obs_version: "v3" = per-lane features with work in output rows (observation_v3.py);
+        "v2" = the same layout with work in estimated cycles; "v1" = token-level lookahead.
+        Older versions exist only to load models trained with them."""
         super().__init__()
         if obs_version not in OBS_VERSIONS:
             raise ValueError(f"obs_version must be one of {OBS_VERSIONS}, got {obs_version!r}")
@@ -52,9 +56,9 @@ class DecoderEnvXSim(gym.Env):
         # Action Space: 0-7 (Regular), 8 (Yield Bus / NO_OP)
         self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
         # Observation Space combining live hardware state and input lookahead
-        self.observation_space = (
-            build_observation_space_v2() if obs_version == "v2" else build_observation_space()
-        )
+        self.observation_space = {
+            "v3": build_observation_space_v3, "v2": build_observation_space_v2, "v1": build_observation_space,
+        }[obs_version]()
 
         self.sim = XSimClient(self.run_dir, verbose=VIVADO_VERBOSE)
         self.lb = LowerBoundTracker()
@@ -102,7 +106,6 @@ class DecoderEnvXSim(gym.Env):
         self.lb.build(self.cmds)
         self.lb_prev = self.lb.compute(self.hw_state)
         self.lb0 = max(self.lb_prev, 1)
-        self.phi_prev = self._phi(self.lb_prev)
 
         return self._get_obs(), {}
 
@@ -134,7 +137,7 @@ class DecoderEnvXSim(gym.Env):
         if terminated:
             self.completed_images += 1
 
-        reward = self._shaped_reward(terminated)
+        reward = self._reward(action, slots_used, terminated)
         return self._get_obs(), reward, terminated, False, self._get_info(terminated)
 
     def action_masks(self) -> np.ndarray:
@@ -254,36 +257,33 @@ class DecoderEnvXSim(gym.Env):
         )
 
     def _fail(self, *, deadlock=False, mismatch=False, violation=None):
-        """Failure terminal. No shaping term here: using Phi(terminal)=0 on a failure would pay the
-        agent the whole remaining potential for crashing. The penalty exceeds any progress credit
-        already earned, so failing is always worse than finishing."""
+        """Failure terminal. Each step costs LAMBDA_T, so crashing would otherwise be cheaper than
+        the >= lb_now cycles still needed: charge those plus FAIL_PENALTY episodes' worth."""
         lb_now = self.lb.compute(self.hw_state)
-        reward = -(FAIL_PENALTY + lb_now / self.lb0)
+        reward = -(FAIL_PENALTY * self.lb0 + lb_now) * LAMBDA_T
         info = {"deadlock": deadlock, "mismatch": mismatch, "violation": violation}
         return self._get_obs(), reward, True, False, info
 
     # ------------------------------------------------------------------ reward / obs / info
-    def _phi(self, lb: float) -> float:
-        """Potential in cycles. Takes lb as an argument so the LB is computed once per step."""
-        return potential(lb, lag_excess(self.hw_state, self.cmds))
-
-    def _shaped_reward(self, terminated: bool) -> float:
-        # reward = (-1 + gamma * Phi(s') - Phi(s)) / lb0, Phi = -(LB + C_LAG * lag_excess^2), Phi(terminal) = 0
+    def _reward(self, action: int, slots_used: int, terminated: bool) -> float:
+        """reward_v2 on the post-step state. lb.compute() runs exactly once per step here: it also
+        advances the per-lane row counter that reward_v2 and observation v3 read."""
         lb_new = self.lb.compute(self.hw_state)
+        rows = [self.lb.rows_decoded(i, self.hw_state) for i in range(NUM_DECODERS)]
         if DEBUG_CHECKS:
             assert lb_new <= self.lb_prev, f"lower bound increased: {self.lb_prev} -> {lb_new}"
             if terminated:
                 assert lb_new == 0, f"episode finished but lb={lb_new} (parts: {self.lb.lb_parts})"
+                assert rows == [NUM_ROWS] * NUM_DECODERS, f"drained but rows decoded per lane = {rows}"
                 if "cmd_popped" in self.hw_state:
                     assert self.hw_state["cmd_popped"] == self.lb.n_sent, (
                         f"drained but RTL pops {self.hw_state['cmd_popped']} != groups sent {self.lb.n_sent}")
-        phi_new = 0.0 if terminated else self._phi(lb_new)
-        reward = (-1.0 + GAMMA * phi_new - self.phi_prev) / self.lb0
-        self.phi_prev = phi_new
         self.lb_prev = lb_new
-        return reward
+        return reward_v2(rows, action, slots_used)
 
     def _get_obs(self):
+        if self.obs_version == "v3":
+            return build_observation_v3(self.hw_state, self.cmds, self.lb, self.action_masks())
         if self.obs_version == "v2":
             return build_observation_v2(self.hw_state, self.cmds, self.lb, self.lb0, self.action_masks())
         return build_observation(self.hw_state, self.cmds, self.initial_tokens, self.lb.n_sent, self.action_masks)

@@ -5,7 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.decoder_env_xsim import DecoderEnvXSim
 # from sb3_contrib import MaskablePPO # If using sb3-contrib
 
-def run_hardware_inference(image_folder, sim_dir, model_path, output_hex_path="run_history.hex", max_cycles=50000):
+def run_hardware_inference(image_folder, sim_dir, model_path, output_hex_path="run_history.hex", max_cycles=50000,
+                           obs_version="v3"):
     """
     Runs a single inference episode on the Xsim environment.
     
@@ -14,9 +15,10 @@ def run_hardware_inference(image_folder, sim_dir, model_path, output_hex_path="r
         model_path: Path to the trained .zip model
         output_hex_path: Where to save the raw hardware actions
         max_cycles: Deadlock threshold
+        obs_version: observation layout the checkpoint was trained with ("v3", "v2" or "v1")
     """
     # Initialize environment specifically for this image
-    env = DecoderEnvXSim(data_dir=image_folder, sim_dir=sim_dir, is_inference=True)
+    env = DecoderEnvXSim(data_dir=image_folder, sim_dir=sim_dir, is_inference=True, obs_version=obs_version)
     model = MaskablePPO.load(model_path)
     
     obs, info = env.reset()

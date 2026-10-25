@@ -1,8 +1,8 @@
 """Potential-based reward shaping from a makespan lower bound and an output-lag penalty."""
 import numpy as np
 
-from .constants import BEATS_ON_BUS, C_LAG, LAG_MARGIN, LIT_FIELDS, NUM_DECODERS
-from .tokens import decode_token_slots, group_ticks
+from .constants import BEATS_ON_BUS, C_LAG, DEBUG_CHECKS, LAG_MARGIN, LIT_FIELDS, NUM_DECODERS, NUM_ROWS
+from .tokens import decode_token_slots, group_ticks, row_delta
 
 
 class LowerBoundTracker:
@@ -20,11 +20,11 @@ class LowerBoundTracker:
     def build(self, cmds: list):
         """Call in reset() after the queues are loaded, before any pops."""
         self.bus_after, self.work_prefix, self.groups_total = [], [], []
-        self.slot_prefix, self.beat_end = [], []
+        self.slot_prefix, self.beat_end, self.row_prefix = [], [], []
         for i, q in enumerate(cmds):
             toks = list(q)
-            needs, costs = [], []
-            pos = 0
+            needs, costs, rows = [], [], []
+            pos = row_ptr = 0
             while pos < len(toks):
                 need = decode_token_slots(toks[pos])[1]
                 if need > BEATS_ON_BUS:
@@ -32,7 +32,13 @@ class LowerBoundTracker:
                 need = min(need, len(toks) - pos)
                 needs.append(need)
                 costs.append(group_ticks(toks[pos]))
+                closed, row_ptr = row_delta(toks[pos], row_ptr)
+                rows.append(closed)
                 pos += need
+            if DEBUG_CHECKS:
+                assert sum(rows) == NUM_ROWS and row_ptr == 0, (
+                    f"queue {i}: token stream closes {sum(rows)} rows (expected {NUM_ROWS}), "
+                    f"{row_ptr} bytes dangling -- output-byte model disagrees with the data")
 
             G = len(needs)
             ba = np.zeros(G + 1, dtype=np.int64)                 # min beats needed from group g onward
@@ -47,10 +53,13 @@ class LowerBoundTracker:
             self.beat_end.append(be)
             self.work_prefix.append(np.concatenate([[0], np.cumsum(costs)]).astype(np.int64))
             self.slot_prefix.append(np.concatenate([[0], np.cumsum(needs)]).astype(np.int64))
+            self.row_prefix.append(np.concatenate([[0], np.cumsum(rows)]).astype(np.int64))
             self.groups_total.append(G)
 
         self.n_sent = [0] * NUM_DECODERS
         self.consumed = [0] * NUM_DECODERS
+        self.rows_popped = [0] * NUM_DECODERS   # rows that left each lane's row queue
+        self._prev_out = None
 
         # initial-bound diagnostics: which term sets lb0?
         work0 = [int(wp[-1]) for wp in self.work_prefix]
@@ -78,6 +87,21 @@ class LowerBoundTracker:
         """Minimum (dense) beats still needed to send the rest of lane i."""
         return int(self.bus_after[i][self.n_sent[i]])
 
+    # Row accounting. rows_sent counts rows whose CMDs are all on the bus (a partial row is unsent).
+    def rows_sent(self, i: int) -> int:
+        return int(self.row_prefix[i][self.n_sent[i]])
+
+    def rows_unsent(self, i: int) -> int:
+        return int(self.row_prefix[i][-1] - self.row_prefix[i][self.n_sent[i]])
+
+    def rows_decoded(self, i: int, hw_state: dict) -> int:
+        """Rows the lane has finished: popped from its row queue plus those still waiting in it."""
+        return self.rows_popped[i] + hw_state["sub_decoders"][i]["out"]
+
+    def rows_inflight(self, i: int, hw_state: dict) -> int:
+        """Rows sent but not yet decoded."""
+        return max(0, self.rows_sent(i) - self.rows_decoded(i, hw_state))
+
     def work_between(self, i: int, g_start: int, g_end: int) -> int:
         return int(self.work_prefix[i][g_end] - self.work_prefix[i][g_start])
 
@@ -91,6 +115,15 @@ class LowerBoundTracker:
         sd = hw_state.get("sub_decoders", [])
         popped = hw_state.get("cmd_popped")
         bus = sum(int(self.bus_after[i][self.n_sent[i]]) for i in range(NUM_DECODERS))
+
+        # Free-run row queue (barrier off): row_ready = row_valid, so the queue pops exactly one
+        # row on every cycle it was non-empty. One @OBS line per call keeps this exact.
+        # shortcut: wrong if the TB is built with BARRIER_EN, switch to a per-lane TB row count then
+        if sd:
+            if self._prev_out is not None:
+                for i in range(NUM_DECODERS):
+                    self.rows_popped[i] += int(self._prev_out[i] > 0)
+            self._prev_out = [sd[i]["out"] for i in range(NUM_DECODERS)]
 
         work_max = 0
         for i in range(NUM_DECODERS):

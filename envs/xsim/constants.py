@@ -14,6 +14,9 @@ LOOKAHEAD_WINDOW = 64
 CMD_FIFO_SIZE = 16
 LIT_FIFO_CAPACITIES = (24, 24, 18, 12)
 OUT_FIFO_SIZE = 4
+# Output rows per lane per frame (TB NUM_ROWS) and decoded bytes per row.
+NUM_ROWS = 720
+ROW_BYTES = 16
 
 DEADLOCK_STALL_CYCLES = 500
 CMD_TYPE = 0
@@ -26,6 +29,11 @@ GAMMA = 1.0
 LAG_MARGIN = 2        # rows of output spread tolerated before the lag term kicks in
 C_LAG = 4.0           # cycles of "virtual lost time" per squared excess row
 FAIL_PENALTY = 2.0    # terminal penalty (in lb0 units) for mismatch / deadlock
+
+# Reward v2 (reward_v2.py): r = -LAMBDA_T - LAMBDA_B * sigma + LAMBDA_A * z_a * slots/8 (non no-op)
+LAMBDA_T = 1.0        # penalty per cycle
+LAMBDA_B = 0.05       # penalty per row of output stdev across lanes (placeholder, tune)
+LAMBDA_A = 0.5        # credit for feeding a lagging lane, in units of LAMBDA_T (placeholder, tune)
 DEBUG_CHECKS = True   # assert LB / CMD-accounting invariants every step; switch off for long runs
 
 # Per-subdecoder FIFO occupancy fields reported in each @OBS line, in order.
