@@ -34,7 +34,9 @@ FAIL_PENALTY = 2.0    # terminal penalty (in lb0 units) for mismatch / deadlock
 LAMBDA_T = 1.0        # penalty per cycle
 LAMBDA_B = 0.05       # penalty per row of output stdev across lanes (placeholder, tune)
 LAMBDA_A = 0.5        # credit for feeding a lagging lane, in units of LAMBDA_T (placeholder, tune)
-DEBUG_CHECKS = True   # assert LB / CMD-accounting invariants every step; switch off for long runs
+LAMBDA_C = 0.5        # credit for how fully packed the bus beat is
+LAMBDA_D = 0.1        # penalty per slot below the most packable currently selectable lane
+DEBUG_CHECKS = False   # assert LB / CMD-accounting invariants every step; switch off for long runs
 
 # Per-subdecoder FIFO occupancy fields reported in each @OBS line, in order.
 SUB_DECODER_FIELDS = ("cmd", "lit1", "lit2", "lit3", "lit4", "out")

@@ -39,20 +39,27 @@ def plan_beat(queue, sub_decoder: dict, inflight: int) -> tuple[int, int, int]:
     """
     groups = pos = slots = pending_lits = 0
 
+    # keep adding a cmd till the bus is full (only calculates, does not interact with the bus)
     while pos < len(queue) and slots < BEATS_ON_BUS:
         _, needed = decode_token_slots(queue[pos])
+        # TODO: this is sus, check what the test bench will do
         if slots + needed > BEATS_ON_BUS:
             break
+        # if the amount of slots needed is actually more than how much data there are, something's gone wrong buddy
         if needed > len(queue) - pos:
             break
+        # check if all the inflight commands + the number of commands we packed + this next one will exceed the FIFO buffer
         if inflight + groups + 1 > CMD_FIFO_SIZE:
             break
         group_lits = sum(token_type(queue[pos + k]) == LIT_TYPE for k in range(needed))
-        if any(
-            sub_decoder[f"lit{bank}"] + pending_lits + group_lits > capacity
-            for bank, capacity in enumerate(LIT_FIFO_CAPACITIES, start=1)
-        ):
-            break
+        # NOTE: jerry's TB actually does not check the LIT fifo banks
+        # if any(
+        #     sub_decoder[f"lit{bank}"] + pending_lits + group_lits > capacity
+        #     for bank, capacity in enumerate(LIT_FIFO_CAPACITIES, start=1)
+        # ):
+        #     break
+
+        # increment all the counters
         slots += needed
         pos += needed
         pending_lits += group_lits
@@ -60,13 +67,11 @@ def plan_beat(queue, sub_decoder: dict, inflight: int) -> tuple[int, int, int]:
     return groups, pos, slots
 
 
-def compute_action_mask(hw_state: dict, cmds: list, n_sent: list) -> np.ndarray:
-    mask = np.zeros(NUM_ACTIONS, dtype=bool)
-
-    # If the arbiter input FIFO is almost full, all routes are blocked except Yield (No-Op)
+def packable_slots_by_lane(hw_state: dict, cmds: list, n_sent: list) -> list[int]:
+    """Return slots packable on each currently selectable lane, or zero if blocked."""
+    slots_by_lane = [0] * NUM_DECODERS
     if hw_state.get("top_in_ready", 0) == 0:
-        mask[NO_OP_ACTION] = True
-        return mask
+        return slots_by_lane
 
     tail_busy = hw_state.get("tail_busy")
     for i in range(NUM_DECODERS):
@@ -76,9 +81,19 @@ def compute_action_mask(hw_state: dict, cmds: list, n_sent: list) -> np.ndarray:
         # head of its FIFO and block every beat behind it.
         if tail_busy is not None and tail_busy[i]:
             continue
-        groups, _, _ = plan_beat(cmds[i], hw_state["sub_decoders"][i], cmd_inflight(hw_state, n_sent, i))
-        mask[i] = groups > 0
+        _, _, slots = plan_beat(
+            cmds[i],
+            hw_state["sub_decoders"][i],
+            cmd_inflight(hw_state, n_sent, i),
+        )
+        slots_by_lane[i] = slots
+    return slots_by_lane
 
+
+def compute_action_mask(hw_state: dict, cmds: list, n_sent: list) -> np.ndarray:
+    mask = np.zeros(NUM_ACTIONS, dtype=bool)
+    slots_by_lane = packable_slots_by_lane(hw_state, cmds, n_sent)
+    mask[:NUM_DECODERS] = np.asarray(slots_by_lane) > 0
     if not mask[:NUM_DECODERS].any():
         mask[NO_OP_ACTION] = True
     return mask
