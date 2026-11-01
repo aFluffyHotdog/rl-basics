@@ -1,6 +1,6 @@
 """Reward v2: no potential shaping. Per step,
 
-    r_t = -LAMBDA_T - LAMBDA_B * sigma(t) + LAMBDA_A * z_a * [a_t is not no-op] + LAMBDA_C(slots_a / BEATS_ON_BUS) - LAMBDA_D * (best_slots - slots_a)
+    r_t = -LAMBDA_T - LAMBDA_B * sigma(t) + LAMBDA_A * z_a * [a_t is not no-op] + LAMBDA_C(slots_a / BEATS_ON_BUS)
     z_a = (mean(rows) - rows[a]) / max(sigma(t), 1)
 
 where rows[i] is the number of rows lane i has output (LowerBoundTracker.rows_decoded) and sigma is
@@ -29,8 +29,5 @@ def reward_v2(rows, action: int, slots_used: int, best_slots: int | None = None)
     r = -LAMBDA_T - LAMBDA_B * sigma
     if action != NO_OP_ACTION:
         z = (rows.mean() - rows[action]) / max(sigma, 1.0)
-        r += LAMBDA_A * z
-        r += LAMBDA_C * (slots_used / BEATS_ON_BUS)
-        if best_slots is not None:
-            r -= LAMBDA_D * max(best_slots - slots_used, 0) / BEATS_ON_BUS
+        r += LAMBDA_A * z * (slots_used / BEATS_ON_BUS)
     return float(r)

@@ -136,8 +136,8 @@ class HwEpisodeStatsCallback(BaseCallback):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data_dir', type=str, required=True, help="Path to dataset folder containing beats_hex")
-    ap.add_argument('--sim_dir', type=str, required=True, help="Path to the xsim simulation directory")
+    ap.add_argument('--data-dir', type=str, required=True, help="Path to dataset folder containing beats_hex")
+    ap.add_argument('--sim-dir', type=str, required=True, help="Path to the xsim simulation directory")
     ap.add_argument('--total_timesteps', type=int, default=60_000_000, help="Total training iterations")
     ap.add_argument('--save_freq', type=int, default=100_000, help="Save checkpoint every N steps")
     ap.add_argument('--resume_path', type=str, default=None, help="Path to checkpoint model to resume")
