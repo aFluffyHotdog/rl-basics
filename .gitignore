@@ -18,3 +18,4 @@ ENV/
 .DS_Store
 *.log
 sample_data/
+hexes_plots/

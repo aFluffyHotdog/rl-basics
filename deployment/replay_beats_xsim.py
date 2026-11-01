@@ -5,7 +5,7 @@ The beat file can come from the v20 testbench's DUMP_BUS (bus_beats.txt), testbe
 recorded stream is sent as-is, and the testbench's checker counters are reported so a stream recorded
 under different timing shows where it would have tripped the arbiter / FIFO gates.
 
-Accepted line formats (blank lines and lines starting with '#' are ignored):
+Accepted line formats (blank lines and comments are ignored; lines marked '// IDLE' are skipped):
   <hex>            34-digit {dest[4], ncmd-1[3], payload[128]}  (bus_beats.txt / infer_xsim output)
   <valid> <hex>    action.txt format; valid=0 lines are dropped
 Dropped beats: dest >= 8 (no-op records, or bypass beats -- the bypass is disabled in
@@ -54,10 +54,20 @@ def _resolve_beats_dir(image_dir: Path) -> Path:
 def load_beats(path: Path) -> list[str]:
     """Read the beat file -> normalised 34-digit hex beats for lanes 0..7, in file order."""
     beats = []
-    dropped = {"valid=0": 0, "dest>=8": 0, "empty payload": 0}
+    dropped = {"IDLE": 0, "valid=0": 0, "dest>=8": 0, "empty payload": 0}
     for line_no, line in enumerate(path.read_text(encoding="ascii").splitlines(), start=1):
+        comment_start = len(line)
+        for marker in ("//", "#"):
+            marker_index = line.find(marker)
+            if marker_index >= 0:
+                comment_start = min(comment_start, marker_index)
+        comment = line[comment_start:]
+        if comment.startswith("//") and comment[2:].lstrip().startswith("IDLE"):
+            dropped["IDLE"] += 1
+            continue
+        line = line[:comment_start].strip()
         parts = line.split()
-        if not parts or parts[0].startswith("#"):
+        if not parts:
             continue
         if len(parts) == 2:
             if parts[0] not in ("0", "1"):
@@ -225,7 +235,7 @@ def main() -> None:
              "the testbench loads this image's golden rows.",
     )
     parser.add_argument("--sim-dir", type=Path, required=True, help="Path to the XSim simulation directory.")
-    parser.add_argument("--max-cycles", type=int, default=50000)
+    parser.add_argument("--max-cycles", type=int, default=5000)
     parser.add_argument("--verbose", action="store_true", help="Print every beat and the raw XSim output.")
     args = parser.parse_args()
 
