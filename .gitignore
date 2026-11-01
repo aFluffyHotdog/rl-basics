@@ -19,3 +19,4 @@ ENV/
 *.log
 sample_data/
 hexes_plots/
+data/

@@ -35,6 +35,18 @@ def test_packable_slots_by_lane_matches_feasible_beat_capacity():
     ]
 
 
+def test_inflight_gate_blocks_lanes_over_the_testbench_limit():
+    cmds = [_token_queue(1), _token_queue(1)] + [[] for _ in range(6)]
+    hw_state = _hw_state()
+    hw_state["cmd_popped"] = [0] * 8
+    n_sent = [8, 9] + [0] * 6   # lane 0: 8 in flight, lane 1: 9 in flight
+
+    assert compute_action_mask(hw_state, cmds, n_sent)[:2].tolist() == [True, True]
+    gated = compute_action_mask(hw_state, cmds, n_sent, inflight_gate=8)
+    assert gated[:2].tolist() == [True, False]
+    assert not gated[NO_OP_ACTION]
+
+
 def test_packable_slots_excludes_busy_lanes_and_all_lanes_when_input_blocked():
     cmds = [_token_queue(1), _token_queue(2)] + [[] for _ in range(6)]
     busy_slots = packable_slots_by_lane(

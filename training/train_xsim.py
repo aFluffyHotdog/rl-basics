@@ -17,7 +17,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 # Import the Hardware Environment
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from envs.decoder_env_xsim import DecoderEnvXSim, EXT_OBS_KEYS, NUM_DECODERS
+from envs.decoder_env_xsim import DecoderEnvXSim, EXT_OBS_KEYS, NUM_DECODERS, TB_INFLIGHT_GATE
 from agents.lane_extractor import LaneSharedExtractor
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -28,6 +28,50 @@ def linear_schedule(initial_value: float) -> Callable[[float], float]:
 def mask_fn(env: gym.Env) -> np.ndarray:
     """Helper function required by ActionMasker to pull masks from the base env."""
     return env.action_masks()
+
+def make_vec_env(data_dir, sim_dir, obs_version, inflight_gate=None, vecnorm_path=None, is_inference=False):
+    """The wrapped training env: ActionMasker -> Monitor -> DummyVecEnv -> VecNormalize.
+
+    vecnorm_path: load saved VecNormalize statistics (e.g. from collect_teacher.py) instead of
+    starting fresh, so observations / rewards are scaled as they were when that data was recorded.
+    """
+    # WARNING: Do not vectorize multiple HW envs unless you duplicate the sim_dir
+    # to avoid Vivado file-lock collisions in xsim.dir!
+    def make_env():
+        env = DecoderEnvXSim(data_dir=data_dir, sim_dir=sim_dir, is_inference=is_inference,
+                             obs_version=obs_version, inflight_gate=inflight_gate)
+        env = ActionMasker(env, mask_fn)
+        return Monitor(env)
+
+    vec_env = DummyVecEnv([make_env])
+    if vecnorm_path:
+        return VecNormalize.load(vecnorm_path, vec_env)
+    return VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=1.0)
+
+def build_policy_kwargs(obs_version):
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
+    if obs_version in ("v2", "v3", "v4"):
+        policy_kwargs["features_extractor_class"] = LaneSharedExtractor
+    return policy_kwargs
+
+def build_model(vec_env, obs_version, model_cls=MaskablePPO, learning_rate=None, ent_coef=0.01, **kwargs):
+    """Fresh model with the training hyper-parameters (shared with bc_pretrain.py so weights transfer)."""
+    return model_cls(
+        policy="MultiInputPolicy",
+        env=vec_env,
+        learning_rate=learning_rate if learning_rate is not None else linear_schedule(1e-4),
+        n_steps=16384,
+        batch_size=2048,
+        n_epochs=4,
+        gamma=1.0,
+        gae_lambda=0.97,
+        ent_coef=ent_coef,
+        target_kl=0.02,
+        verbose=1,
+        tensorboard_log="./logs/hw_tensorboard",
+        policy_kwargs=build_policy_kwargs(obs_version),
+        **kwargs,
+    )
 
 class HwEpisodeStatsCallback(BaseCallback):
     """Logs episode metrics, physical makespan, and hardware stalemates."""
@@ -141,10 +185,34 @@ def main():
     ap.add_argument('--total_timesteps', type=int, default=60_000_000, help="Total training iterations")
     ap.add_argument('--save_freq', type=int, default=100_000, help="Save checkpoint every N steps")
     ap.add_argument('--resume_path', type=str, default=None, help="Path to checkpoint model to resume")
-    ap.add_argument('--obs_version', type=str, default="v3", choices=["v1", "v2", "v3"],
-                    help="v3 = per-lane features in output rows; v2 = same in estimated cycles; "
+    ap.add_argument('--obs_version', type=str, default="v3", choices=["v1", "v2", "v3", "v4"],
+                    help="v4 = v3 + round-robin teacher state (cycles_since_fed, cursor distance); "
+                         "v3 = per-lane features in output rows; v2 = same in estimated cycles; "
                          "v1 = token lookahead (older versions only for matching checkpoints)")
+    # --- behavior-cloning warm start (training/BC_WARMSTART.md); all off by default ---
+    ap.add_argument('--tb-gate', action='store_true',
+                    help=f"Mask lanes with more than {TB_INFLIGHT_GATE} CMDs in flight (testbench rule; "
+                         "use whenever the teacher / a BC model is involved)")
+    ap.add_argument('--vecnorm-stats', type=str, default=None,
+                    help="VecNormalize statistics (.pkl) to start from, e.g. from collect_teacher.py")
+    ap.add_argument('--init-from', type=str, default=None, help="BC model (.zip) whose policy weights start PPO")
+    ap.add_argument('--kl-prior', type=str, default=None,
+                    help="Frozen BC policy (*_clone.pt); adds beta * KL(pi || clone) to the PPO loss")
+    ap.add_argument('--kl-beta', type=float, default=0.1)
+    ap.add_argument('--kl-decay-episodes', type=int, default=500)
+    ap.add_argument('--lr', type=float, default=None, help="Constant learning rate (default: linear from 1e-4)")
+    ap.add_argument('--ent-coef-schedule', type=str, default=None,
+                    help="Entropy coefficient by episode, e.g. '0:0,100:0.001'")
+    ap.add_argument('--eval-every', type=int, default=None,
+                    help="Evaluate makespan every N episodes and keep models/best.zip "
+                         "(default 25 with --init-from / --kl-prior, else off)")
+    ap.add_argument('--eval-episodes', type=int, default=2)
     args = ap.parse_args()
+    warm_start = bool(args.init_from or args.kl_prior)
+    eval_every = args.eval_every if args.eval_every is not None else (25 if warm_start else 0)
+    if warm_start and not args.tb_gate:
+        print("[train_xsim] WARNING: --init-from / --kl-prior without --tb-gate: the BC policy was trained "
+              "on the testbench mask, PPO will see a different one.")
 
     os.makedirs("logs", exist_ok=True)
     os.makedirs("models", exist_ok=True)
@@ -159,13 +227,9 @@ def main():
     # WARNING: Do not vectorize multiple HW envs unless you duplicate the sim_dir 
     # to avoid Vivado file-lock collisions in xsim.dir!
     print("Initializing Vivado Hardware-in-the-Loop Environment...")
-    def make_env():
-        env = DecoderEnvXSim(data_dir=args.data_dir, sim_dir=args.sim_dir, obs_version=args.obs_version)
-        env = ActionMasker(env, mask_fn)
-        return Monitor(env)
-
-    vec_env = DummyVecEnv([make_env])
-    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=1.0)
+    vec_env = make_vec_env(args.data_dir, args.sim_dir, args.obs_version,
+                           inflight_gate=TB_INFLIGHT_GATE if args.tb_gate else None,
+                           vecnorm_path=args.vecnorm_stats)
 
     # --- 2. Callbacks Setup ---
     stats_cb = HwEpisodeStatsCallback(log_file)
@@ -174,34 +238,37 @@ def main():
         save_path=checkpoint_dir,
         name_prefix="ppo_hw"
     )
-    callbacks = CallbackList([stats_cb, checkpoint_cb])
+    callbacks = [stats_cb, checkpoint_cb]
 
     # --- 3. Model Initialization / Resuming ---
-    custom_objects = {"learning_rate": linear_schedule(3e-4)}
+    model_cls = MaskablePPO
+    if args.kl_prior:
+        from training.kl_ppo import KLMaskablePPO
+        model_cls = KLMaskablePPO
+    custom_objects = {"learning_rate": args.lr if args.lr is not None else linear_schedule(3e-4)}
     
     if args.resume_path:
-        print(f"Loading MaskablePPO from checkpoint: {args.resume_path}")
-        model = MaskablePPO.load(args.resume_path, env=vec_env, custom_objects=custom_objects, tensorboard_log="./logs/hw_tensorboard")
+        print(f"Loading {model_cls.__name__} from checkpoint: {args.resume_path}")
+        model = model_cls.load(args.resume_path, env=vec_env, custom_objects=custom_objects, tensorboard_log="./logs/hw_tensorboard")
     else:
-        print("Initializing new MaskablePPO Model for Hardware...")
-        policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
-        if args.obs_version in ("v2", "v3"):
-            policy_kwargs["features_extractor_class"] = LaneSharedExtractor
-        model = MaskablePPO(
-            policy="MultiInputPolicy",
-            env=vec_env,
-            learning_rate=linear_schedule(1e-4),
-            n_steps=16384,
-            batch_size=2048,
-            n_epochs=4,
-            gamma=1.0,
-            gae_lambda=0.97,
-            ent_coef=0.01,
-            target_kl=0.02,
-            verbose=1,
-            tensorboard_log="./logs/hw_tensorboard",
-            policy_kwargs=policy_kwargs,
-        )
+        print(f"Initializing new {model_cls.__name__} Model for Hardware...")
+        model = build_model(vec_env, args.obs_version, model_cls=model_cls, learning_rate=args.lr)
+        if args.init_from:
+            print(f"Loading behavior-cloned policy weights from {args.init_from}")
+            bc_model = MaskablePPO.load(args.init_from, device=model.device)
+            model.policy.load_state_dict(bc_model.policy.state_dict())
+            del bc_model
+
+    if args.kl_prior:
+        model.set_kl_prior(args.kl_prior, beta=args.kl_beta, decay_episodes=args.kl_decay_episodes)
+    if warm_start or args.ent_coef_schedule or eval_every > 0:
+        from training.bc_callbacks import EpisodeScheduleCallback, MakespanEvalCallback, TeacherMatchCallback
+        callbacks.append(EpisodeScheduleCallback(args.ent_coef_schedule))
+        if warm_start and args.obs_version in ("v3", "v4"):
+            callbacks.append(TeacherMatchCallback())
+        if eval_every > 0:
+            callbacks.append(MakespanEvalCallback(eval_every, args.eval_episodes, best_path="models/best"))
+    callbacks = CallbackList(callbacks)
     
     # --- 4. Training Loop ---
     print(f"Starting hardware-in-the-loop training for {args.total_timesteps} timesteps...")

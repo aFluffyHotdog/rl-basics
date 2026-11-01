@@ -32,28 +32,35 @@ from .flow_control import (
     no_op_reason,
     packable_slots_by_lane,
     plan_beat,
+    tb_rr_advance,
 )
 from .observation import build_observation, build_observation_space
 from .observation_v2 import build_observation_space_v2, build_observation_v2
 from .observation_v3 import build_observation_space_v3, build_observation_v3
+from .observation_v4 import build_observation_space_v4, build_observation_v4
 from .protocol import encode_beat, pack_payload, parse_obs_line
 from .reward import LowerBoundTracker
 from .reward_v2 import reward_v2
 from .sim_client import XSimClient
 
 
-OBS_VERSIONS = ("v1", "v2", "v3")
+OBS_VERSIONS = ("v1", "v2", "v3", "v4")
 
 
 class DecoderEnvXSim(gym.Env):
-    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False, obs_version: str = "v3"):
-        """obs_version: "v3" = per-lane features with work in output rows (observation_v3.py);
-        "v2" = the same layout with work in estimated cycles; "v1" = token-level lookahead.
-        Older versions exist only to load models trained with them."""
+    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False, obs_version: str = "v3",
+                 inflight_gate: int | None = None):
+        """obs_version: "v4" = v3 + per-lane cycles_since_fed and testbench round-robin cursor
+        distance (observation_v4.py); "v3" = per-lane features with work in output rows
+        (observation_v3.py); "v2" = the same layout with work in estimated cycles; "v1" = token-level
+        lookahead. Older versions exist only to load models trained with them.
+        inflight_gate: if set, the mask also blocks lanes with more CMDs in flight than this
+        (TB_INFLIGHT_GATE = the v20 testbench packer's rule). None = CMD FIFO depth only."""
         super().__init__()
         if obs_version not in OBS_VERSIONS:
             raise ValueError(f"obs_version must be one of {OBS_VERSIONS}, got {obs_version!r}")
         self.obs_version = obs_version
+        self.inflight_gate = inflight_gate
         self.data_dir = Path(data_dir).resolve()
         self.sim_dir = Path(sim_dir).resolve()
         self.run_dir = self.sim_dir / "xsim_run" / "run"
@@ -63,7 +70,8 @@ class DecoderEnvXSim(gym.Env):
         self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
         # Observation Space combining live hardware state and input lookahead
         self.observation_space = {
-            "v3": build_observation_space_v3, "v2": build_observation_space_v2, "v1": build_observation_space,
+            "v4": build_observation_space_v4, "v3": build_observation_space_v3,
+            "v2": build_observation_space_v2, "v1": build_observation_space,
         }[obs_version]()
 
         self.sim = XSimClient(self.run_dir, verbose=VIVADO_VERBOSE)
@@ -84,7 +92,10 @@ class DecoderEnvXSim(gym.Env):
 
         restarted = self._restart_sim_if_needed()
 
-        selected_idx = self.np_random.integers(0, len(self.dataset_pool))
+        if options and "sample_idx" in options:   # fixed sample, e.g. for evaluation
+            selected_idx = int(options["sample_idx"]) % len(self.dataset_pool)
+        else:
+            selected_idx = self.np_random.integers(0, len(self.dataset_pool))
         selected_stem_path, selected_dataset = self.dataset_pool[selected_idx]
         self.current_sample_name = str(selected_stem_path.relative_to(self.data_dir))
 
@@ -93,6 +104,9 @@ class DecoderEnvXSim(gym.Env):
         self.initial_tokens = sum(len(cmd) for cmd in self.cmds)
         self.cycles = 0
         self.stall_cycles = 0
+        # Testbench round-robin cursor and per-lane cycles since the last beat (observation v4).
+        self.rr_cursor = 0
+        self.cycles_since_fed = np.zeros(NUM_DECODERS, dtype=np.int64)
 
         if not self.sim.is_running:
             self.sim.start()
@@ -120,10 +134,12 @@ class DecoderEnvXSim(gym.Env):
         action = int(action)
         # log_top_not_ready_fifo_state(self.top_not_ready_log_path, self.cycles, action, self.hw_state)
 
-        packable_slots = packable_slots_by_lane(self.hw_state, self.cmds, self.lb.n_sent)
+        packable_slots = packable_slots_by_lane(self.hw_state, self.cmds, self.lb.n_sent, self.inflight_gate)
         best_slots = max(packable_slots)
+        in_ready = bool(self.hw_state.get("top_in_ready", 0))
         valid_bit, commands_packed, payload_128b, slots_used = self._pack_beat(action)
         self._mask_cache = None   # queues / n_sent changed
+        self._track_schedule(action if valid_bit else NO_OP_ACTION, in_ready)
 
         action_hex = encode_beat(action, commands_packed, payload_128b)
         self.sim.write_action(f"{valid_bit} {action_hex}")
@@ -150,7 +166,7 @@ class DecoderEnvXSim(gym.Env):
 
     def action_masks(self) -> np.ndarray:
         if self._mask_cache is None:
-            self._mask_cache = compute_action_mask(self.hw_state, self.cmds, self.lb.n_sent)
+            self._mask_cache = compute_action_mask(self.hw_state, self.cmds, self.lb.n_sent, self.inflight_gate)
         return self._mask_cache.copy()
 
     def close(self):
@@ -200,6 +216,13 @@ class DecoderEnvXSim(gym.Env):
 
         valid_bit = 1 if groups > 0 else 0   # never send an empty beat flagged valid
         return valid_bit, groups, payload_128b, slots_used
+
+    def _track_schedule(self, sent_lane: int, in_ready: bool):
+        """Advance the testbench round-robin cursor and the per-lane cycles-since-fed counters."""
+        self.rr_cursor = tb_rr_advance(self.rr_cursor, sent_lane, in_ready)
+        self.cycles_since_fed += 1
+        if sent_lane != NO_OP_ACTION:
+            self.cycles_since_fed[sent_lane] = 0
 
     def _print_step_debug(self, action_dest, commands_packed, slots_used, action_hex):
         print(f"[Env] action_dest: {action_dest}, commands_packed: {commands_packed}, slots_used: {slots_used}")
@@ -304,6 +327,9 @@ class DecoderEnvXSim(gym.Env):
         return reward_v2(rows, action, slots_used, best_slots)
 
     def _get_obs(self):
+        if self.obs_version == "v4":
+            return build_observation_v4(self.hw_state, self.cmds, self.lb, self.action_masks(),
+                                        self.cycles_since_fed, self.rr_cursor)
         if self.obs_version == "v3":
             return build_observation_v3(self.hw_state, self.cmds, self.lb, self.action_masks())
         if self.obs_version == "v2":

@@ -9,6 +9,7 @@ from .constants import (
     NO_OP_ACTION,
     NUM_ACTIONS,
     NUM_DECODERS,
+    TB_RR_CHANNELS,
 )
 from .tokens import decode_token_slots, token_type
 
@@ -67,8 +68,12 @@ def plan_beat(queue, sub_decoder: dict, inflight: int) -> tuple[int, int, int]:
     return groups, pos, slots
 
 
-def packable_slots_by_lane(hw_state: dict, cmds: list, n_sent: list) -> list[int]:
-    """Return slots packable on each currently selectable lane, or zero if blocked."""
+def packable_slots_by_lane(hw_state: dict, cmds: list, n_sent: list, inflight_gate: int | None = None) -> list[int]:
+    """Return slots packable on each currently selectable lane, or zero if blocked.
+
+    inflight_gate: if set, a lane with more CMDs in flight than this is blocked as well (the v20
+    testbench packer uses TB_INFLIGHT_GATE). None keeps the CMD-FIFO-depth limit only.
+    """
     slots_by_lane = [0] * NUM_DECODERS
     if hw_state.get("top_in_ready", 0) == 0:
         return slots_by_lane
@@ -81,18 +86,39 @@ def packable_slots_by_lane(hw_state: dict, cmds: list, n_sent: list) -> list[int
         # head of its FIFO and block every beat behind it.
         if tail_busy is not None and tail_busy[i]:
             continue
-        _, _, slots = plan_beat(
-            cmds[i],
-            hw_state["sub_decoders"][i],
-            cmd_inflight(hw_state, n_sent, i),
-        )
+        inflight = cmd_inflight(hw_state, n_sent, i)
+        if inflight_gate is not None and inflight > inflight_gate:
+            continue
+        _, _, slots = plan_beat(cmds[i], hw_state["sub_decoders"][i], inflight)
         slots_by_lane[i] = slots
     return slots_by_lane
 
 
-def compute_action_mask(hw_state: dict, cmds: list, n_sent: list) -> np.ndarray:
+def tb_rr_pick(rr: int, eligible) -> int | None:
+    """First eligible lane scanning the testbench cursor rr, rr+1, ... mod TB_RR_CHANNELS, else None.
+
+    The bypass slot (index 8) takes a turn in the scan but is never eligible (disabled in the TB).
+    """
+    for k in range(TB_RR_CHANNELS):
+        s = (rr + k) % TB_RR_CHANNELS
+        if s < NUM_DECODERS and eligible[s]:
+            return s
+    return None
+
+
+def tb_rr_advance(rr: int, action: int, in_ready: bool) -> int:
+    """Testbench cursor after a cycle: served lane + 1; +1 on an idle cycle with the bus ready;
+    unchanged while top_in_ready is low."""
+    if action != NO_OP_ACTION:
+        return (action + 1) % TB_RR_CHANNELS
+    if in_ready:
+        return (rr + 1) % TB_RR_CHANNELS
+    return rr
+
+
+def compute_action_mask(hw_state: dict, cmds: list, n_sent: list, inflight_gate: int | None = None) -> np.ndarray:
     mask = np.zeros(NUM_ACTIONS, dtype=bool)
-    slots_by_lane = packable_slots_by_lane(hw_state, cmds, n_sent)
+    slots_by_lane = packable_slots_by_lane(hw_state, cmds, n_sent, inflight_gate)
     mask[:NUM_DECODERS] = np.asarray(slots_by_lane) > 0
     if not mask[:NUM_DECODERS].any():
         mask[NO_OP_ACTION] = True

@@ -38,18 +38,15 @@ from envs.xsim.constants import (
     RLE_TYPE,
     ROW_BYTES,
     SUB_DECODER_FIELDS,
+    TB_INFLIGHT_GATE,
     TB_VIOLATION_KEYS,
 )
 from envs.xsim.dataset import _stem_path, load_hex_folder
-from envs.xsim.flow_control import cmd_inflight
+from envs.xsim.flow_control import cmd_inflight, tb_rr_advance, tb_rr_pick
 from envs.xsim.protocol import encode_beat, pack_payload, parse_obs_line
 from envs.xsim.sim_client import XSimClient
 from envs.xsim.tokens import token_type
 
-# The TB round-robins over 8 regular sub-decs + the bypass channel (index 8).
-NUM_CHANNELS = NUM_DECODERS + 1
-# TB packer gate: (pk_cmd_idx - cmd_popped) <= 8, so a beat of <= 8 CMDs never overfills the 16-deep CMD FIFO.
-INFLIGHT_GATE = 8
 DESER_BASELINE = NUM_ROWS * 8
 CHECK_KEYS = TB_VIOLATION_KEYS + ("lane_mismatches",)
 
@@ -156,7 +153,8 @@ class TestbenchPacker:
         tail_busy = hw_state.get("tail_busy")
         if tail_busy is not None and tail_busy[s]:
             return False
-        if cmd_inflight(hw_state, self.n_sent, s) > INFLIGHT_GATE:
+        # (pk_cmd_idx - cmd_popped) <= 8, so a beat of <= 8 CMDs never overfills the 16-deep CMD FIFO.
+        if cmd_inflight(hw_state, self.n_sent, s) > TB_INFLIGHT_GATE:
             return False
         return self._skew_ok(s, hw_state)
 
@@ -178,16 +176,12 @@ class TestbenchPacker:
         if not hw_state.get("top_in_ready", 0):
             return None, "top_in_not_ready"
 
-        for k in range(NUM_CHANNELS):
-            s = (self.rr + k) % NUM_CHANNELS
-            if s >= NUM_DECODERS:
-                continue   # bypass channel: disabled in tb_interactive.sv
-            if self._eligible(s, hw_state):
-                self.rr = (s + 1) % NUM_CHANNELS
-                return self._pack(s), ""
-
-        self.rr = (self.rr + 1) % NUM_CHANNELS
-        return None, "no_eligible_lane"
+        # Cursor scan over the 8 lanes + the bypass slot (disabled in tb_interactive.sv).
+        lane = tb_rr_pick(self.rr, [self._eligible(s, hw_state) for s in range(NUM_DECODERS)])
+        self.rr = tb_rr_advance(self.rr, NO_OP_ACTION if lane is None else lane, in_ready=True)
+        if lane is None:
+            return None, "no_eligible_lane"
+        return self._pack(lane), ""
 
 
 # ---------------------------------------------------------------------- sim loop

@@ -19,6 +19,12 @@ NUM_ROWS = 720
 ROW_BYTES = 16
 
 DEADLOCK_STALL_CYCLES = 500
+
+# v20 testbench packer (blk_packer_v17), used by the round-robin teacher and the opt-in mask gate.
+TB_INFLIGHT_GATE = 8                  # TB only feeds a lane with <= 8 CMDs in flight (committed - popped)
+TB_RR_CHANNELS = NUM_DECODERS + 1     # TB cursor runs over the 8 lanes + the (disabled) bypass channel
+# Observation v4: cycles since a lane last received a beat, divided by this and clipped to 1.
+CYCLES_SINCE_FED_SCALE = 64
 CMD_TYPE = 0
 LIT_TYPE = 1
 RLE_TYPE = 2
