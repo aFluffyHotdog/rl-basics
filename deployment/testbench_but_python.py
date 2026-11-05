@@ -20,8 +20,9 @@ Differences from the SystemVerilog testbench:
 """
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -141,6 +142,10 @@ class TestbenchPacker:
     def remaining(self) -> int:
         return sum(len(lane) - sent for lane, sent in zip(self.groups, self.n_sent))
 
+    def projected_rows(self) -> list[int]:
+        """Rows covered by the CMDs sent so far, per lane (rows output + rows still in flight)."""
+        return [rows[sent] for rows, sent in zip(self.rows_before, self.n_sent)]
+
     def _skew_ok(self, s: int, hw_state: dict) -> bool:
         """skew_ok(): a lane may not run more than skew_bound rows ahead of the barrier's pops."""
         if self.skew_bound is None:
@@ -184,6 +189,58 @@ class TestbenchPacker:
         return self._pack(lane), ""
 
 
+# ---------------------------------------------------------------------- balance metrics
+class BalanceStats:
+    """Per-cycle row spread (max - min over the lanes) for the run summary.
+
+      * projected rows: rows covered by the CMDs already sent (= rows output + rows the in-flight
+        CMDs will output), from the packer's own bookkeeping;
+      * output rows: rows each lane has actually produced. Free-run counter, same rule as
+        LowerBoundTracker.compute(): the row queue pops one row on every cycle it was non-empty, so
+        rows = pops + rows still queued. Exact only when the TB is built without BARRIER_EN.
+    """
+
+    def __init__(self, hw_state: dict):
+        self.popped = [0] * NUM_DECODERS
+        self.prev_out = self._outs(hw_state)
+        self.cycles = 0
+        self.proj_max = self.proj_sum = self.out_max = self.out_sum = 0
+        self.projected = [0] * NUM_DECODERS
+        self.output = [0] * NUM_DECODERS
+
+    @staticmethod
+    def _outs(hw_state: dict) -> list[int] | None:
+        sd = hw_state.get("sub_decoders")
+        return [d["out"] for d in sd[:NUM_DECODERS]] if sd else None
+
+    def update(self, packer: "TestbenchPacker", hw_state: dict):
+        """Call once per cycle, after the @OBS line for that cycle is parsed."""
+        outs = self._outs(hw_state)
+        if outs is not None:
+            if self.prev_out is not None:
+                for i in range(NUM_DECODERS):
+                    self.popped[i] += int(self.prev_out[i] > 0)
+            self.prev_out = outs
+            self.output = [p + o for p, o in zip(self.popped, outs)]
+        self.projected = packer.projected_rows()
+        proj_spread = max(self.projected) - min(self.projected)
+        out_spread = max(self.output) - min(self.output)
+        self.cycles += 1
+        self.proj_max = max(self.proj_max, proj_spread)
+        self.proj_sum += proj_spread
+        self.out_max = max(self.out_max, out_spread)
+        self.out_sum += out_spread
+
+    def summary(self) -> dict:
+        n = max(self.cycles, 1)
+        return {
+            "max_projected_spread": self.proj_max,
+            "mean_projected_spread": self.proj_sum / n,
+            "max_output_spread": self.out_max,
+            "mean_output_spread": self.out_sum / n,
+        }
+
+
 # ---------------------------------------------------------------------- sim loop
 def _resolve_beats_dir(image_dir: Path) -> Path:
     image_dir = image_dir.resolve()
@@ -219,13 +276,15 @@ def run(
     skew_bound: int | None = None,
     max_cycles: int = 50000,
     verbose: bool = False,
+    make_packer: Callable[[list], "TestbenchPacker"] | None = None,
 ) -> dict:
+    """make_packer(groups) builds the packer; default is the TB round-robin TestbenchPacker."""
     if max_cycles <= 0:
         raise ValueError("max_cycles must be greater than zero")
     beats_dir = _resolve_beats_dir(image_dir)
     lanes = load_hex_folder(beats_dir)
     groups = [split_groups(list(queue), lane) for lane, queue in enumerate(lanes)]
-    packer = TestbenchPacker(groups, skew_bound)
+    packer = make_packer(groups) if make_packer else TestbenchPacker(groups, skew_bound)
     stem = str(_stem_path(beats_dir)).replace("beats_hex", "rows_hex")
     print(f"Loaded {beats_dir}: CMDs per lane = {[len(lane) for lane in groups]}")
 
@@ -238,7 +297,7 @@ def run(
     sim = XSimClient(sim_dir.resolve() / "xsim_run" / "run", verbose=verbose)
     accepted = []
     beats_per_lane = [0] * NUM_DECODERS
-    idle = {"top_in_not_ready": 0, "no_eligible_lane": 0}
+    idle = Counter()
     slots_sent = 0
     wall = None
     stall = 0
@@ -256,6 +315,7 @@ def run(
         if skew_bound is not None and "rows_consumed" not in hw_state:
             raise RuntimeError("--skew-bound needs rows_consumed in @OBS (extended tb_interactive.sv)")
         base = {k: hw_state.get(k, 0) for k in CHECK_KEYS}
+        balance = BalanceStats(hw_state)
 
         for cycle in range(1, max_cycles + 1):
             beat, idle_reason = packer.choose(hw_state)
@@ -266,13 +326,15 @@ def run(
                 action_hex = encode_beat(beat.dest, beat.ncmd, beat.payload)
             sim.write_action(f"{0 if beat is None else 1} {action_hex}")
             advance()
+            balance.update(packer, hw_state)
 
             if beat is not None:
                 accepted.append(action_hex)
                 beats_per_lane[beat.dest] += 1
                 slots_sent += beat.slots
                 if verbose:
-                    print(f"[TB-PY] cyc {cycle}: lane {beat.dest} ncmd={beat.ncmd} slots={beat.slots} {action_hex}")
+                    print(f"[TB-PY] cyc {cycle}: lane {beat.dest} ncmd={beat.ncmd} slots={beat.slots} {action_hex} "
+                          f"projected rows={balance.projected}")
 
             # The packer applies the same gates as check_beat, so any increase is a port bug.
             for key in CHECK_KEYS:
@@ -300,6 +362,7 @@ def run(
     cycles = cycle if wall is None else wall
     rows = hw_state.get("rows_consumed", NUM_ROWS if wall else 0)
     deltas = {k: hw_state.get(k, 0) - base[k] for k in CHECK_KEYS}
+    spread = balance.summary()
     print()
     print(f">>> [v20 TDM SYNC] wall = {wall if wall is not None else 'n/a'} cyc, rows = {rows}, "
           f"mismatches = {hw_state.get('mismatches', 0)}")
@@ -307,14 +370,19 @@ def run(
         print(f"    speedup vs deser    = {DESER_BASELINE / wall:.2f}x ({DESER_BASELINE} / {wall})")
     print(f"    beats sent          = {len(accepted)} over {cycles} cycles "
           f"(avg {slots_sent / max(len(accepted), 1):.2f} / {BEATS_ON_BUS} slots per beat)")
-    print(f"    idle cycles         = {idle}")
+    print(f"    idle cycles         = {dict(idle)}")
     print(f"    beats per lane      = {beats_per_lane}")
     print(f"    CMDs sent per lane  = {packer.n_sent}")
     print(f"    testbench counters  = {deltas}")
+    print(f"    row spread / cycle  = projected max {spread['max_projected_spread']} "
+          f"mean {spread['mean_projected_spread']:.2f} | output max {spread['max_output_spread']} "
+          f"mean {spread['mean_output_spread']:.2f} (output counter assumes free-run)")
+    print(f"    rows out per lane   = {balance.output}")
     print(f"Accepted bus beats saved to: {output_path}")
     if wall is None:
         raise RuntimeError(f"Image did not finish within {cycles} cycles.")
-    return {"wall": wall, "beats": len(accepted), "idle": idle, "beats_per_lane": beats_per_lane, **deltas}
+    return {"wall": wall, "beats": len(accepted), "idle": dict(idle), "beats_per_lane": beats_per_lane,
+            **spread, **deltas}
 
 
 def main() -> None:
