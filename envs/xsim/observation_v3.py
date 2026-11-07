@@ -16,31 +16,35 @@ from .observation_v2 import BEAT_WORK_SCALE, RUNWAY_SCALE
 from .reward import LowerBoundTracker
 
 LANE_FEATURES = (
-    "work_left",     # rows whose CMDs are not all on the bus yet / NUM_ROWS
-    "work_gap",      # (max lane work_left - this lane's work_left) / NUM_ROWS
-    "unsent_work",   # rows sent to the lane but not yet decoded / NUM_ROWS
-    "beats_left",    # dense beats still needed for this lane / bus0
-    "inflight",      # CMDs sent but not popped / CMD FIFO depth
-    "cmd_fifo",      # CMD FIFO occupancy / depth
-    "runway",        # buffered decode work (sent, not popped) / RUNWAY_SCALE
-    "tail_busy",     # arbiter tail busy flag
-    "eligible",      # action mask bit
+    "work_left",     # KEEP rows whose CMDs are not all on the bus yet / NUM_ROWS
+    "work_gap",      # DELETE (max lane work_left - this lane's work_left) / NUM_ROWS
+    "unsent_work",   # DELETE rows sent to the lane but not yet decoded / NUM_ROWS
+    "beats_left",    # KEEP dense beats still needed for this lane / bus0
+    "inflight",      # KEEP CMDs sent but not popped / CMD FIFO depth
+    "cmd_fifo",      # KEEP CMD FIFO occupancy / depth
+    "runway",        # DELETE buffered decode work (sent, not popped) / RUNWAY_SCALE
+    "tail_busy",     # KEEP arbiter tail busy flag
+    "eligible",      # KEEP action mask bit
     "lane_outputs",  # exact rows decoded by this lane / NUM_ROWS
-    "lag_score",     # (mean decoded rows - this lane's rows) / max(stdev, 1)
-    "expected_utilization",  # slots the next beat would use / BEATS_ON_BUS
-    "beat1_slots",   # slots the beat sent now would carry (0 if not eligible) / BEATS_ON_BUS
-    "beat1_work",    # decode work in that beat / BEAT_WORK_SCALE
-    "beat2_slots",   # slots of the following dense beat / BEATS_ON_BUS
-    "beat2_work",    # decode work in that beat / BEAT_WORK_SCALE
-    "lit4_fill",     # literal bank 4 occupancy / capacity (the smallest bank)
+    "lag_score",     # DELETE (we do free run) (mean decoded rows - this lane's rows) / max(stdev, 1)
+    "expected_utilization",  # KEEP slots the next beat would use / BEATS_ON_BUS
+    # TODO: add the type of the next beats
+    "beat1_slots",   # KEEP slots the beat sent now would carry (0 if not eligible) / BEATS_ON_BUS
+    "beat1_work",    # KEEP decode work in that beat / BEAT_WORK_SCALE
+    "beat2_slots",   # KEEP slots of the following dense beat / BEATS_ON_BUS
+    "beat2_work",    # KEEP decode work in that beat / BEAT_WORK_SCALE
+    # TODO: sum up the capacity of all FIFOs
+    "lit4_fill",     # DELETE literal bank 4 occupancy / capacity (the smallest bank)
 )
 GLOBAL_FEATURES = (
-    "in_ready",      # arbiter input ready
-    "bus_left",      # total dense beats left / bus0
-    "work_left_max", # bottleneck lane's work_left / NUM_ROWS
-    "n_eligible",    # eligible lanes / NUM_DECODERS
-    "mean_outputs",  # mean decoded rows across lanes / NUM_ROWS
-    "stdev_outputs", # population stdev of decoded rows across lanes / NUM_ROWS
+    # TODO:
+    # throughput (the number of complete rows in the past ~20 cycles)
+    "in_ready",      # KEEP arbiter input ready 
+    "bus_left",      # CHANGE total dense beats left / bus0 
+    "work_left_max", # DELETE bottleneck lane's work_left / 
+    "n_eligible",    # KEEP eligible lanes / NUM_DECODERS 
+    "mean_outputs",  # KEEP mean decoded rows across lanes / NUM_ROWS
+    "stdev_outputs", # KEEP population stdev of decoded rows across lanes / NUM_ROWS
 )
 
 _F = {name: k for k, name in enumerate(LANE_FEATURES)}
