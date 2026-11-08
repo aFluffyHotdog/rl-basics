@@ -129,6 +129,7 @@ class DecoderEnvXSim(gym.Env):
 
         return self._get_obs(), {}
 
+    # TODO: make this automatically increment cycle and send no-ops when top_in is not ready
     def step(self, action):
         self.cycles += 1
         action = int(action)

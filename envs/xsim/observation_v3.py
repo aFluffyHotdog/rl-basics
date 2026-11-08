@@ -39,7 +39,7 @@ LANE_FEATURES = (
 GLOBAL_FEATURES = (
     # TODO:
     # throughput (the number of complete rows in the past ~20 cycles)
-    "in_ready",      # KEEP arbiter input ready 
+    "in_ready",      # DELETE arbiter input ready 
     "bus_left",      # CHANGE total dense beats left / bus0 
     "work_left_max", # DELETE bottleneck lane's work_left / 
     "n_eligible",    # KEEP eligible lanes / NUM_DECODERS 
