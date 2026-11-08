@@ -10,10 +10,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from envs.xsim.constants import CMD_TYPE, NO_OP_ACTION, NUM_DECODERS
-from envs.xsim.dataset import load_hex_folder
+from envs.xsim.constants import NO_OP_ACTION, NUM_DECODERS
 from envs.xsim.env import DecoderEnvXSim
-from envs.xsim.tokens import token_type
 
 
 def _resolve_beats_dir(image_dir: Path) -> Path:
@@ -30,9 +28,13 @@ def _resolve_beats_dir(image_dir: Path) -> Path:
 
 
 def _schedule_counts(beats_dir: Path) -> list[int]:
-    """Use each lane's CMD count as an upper bound on the number of dispatch attempts."""
-    lanes = load_hex_folder(beats_dir)
-    counts = [sum(token_type(token) == CMD_TYPE for token in lane) for lane in lanes]
+    """Count the compressed rows available to each lane."""
+    rows_dir = beats_dir.parent / "rows_hex"
+    row_files = sorted(rows_dir.glob("*.hex"))
+    counts = [
+        sum(bool(line.strip()) for line in row_files[lane].read_text(encoding="ascii").splitlines())
+        for lane in range(min(NUM_DECODERS, len(row_files)))
+    ]
     if len(counts) != NUM_DECODERS:
         raise ValueError(f"Expected {NUM_DECODERS} lanes, found {len(counts)}")
     if not any(counts):
@@ -44,21 +46,25 @@ def generate_schedules(counts: Sequence[int]) -> Iterator[tuple[int, ...]]:
     """Yield every distinct ordering of lane IDs with the requested multiplicities."""
     remaining = list(counts)
     schedule: list[int] = []
-
-    def visit():
-        if len(schedule) == sum(counts):
+    next_lane = [0]
+    total = sum(counts)
+    while next_lane:
+        lane = next_lane[-1]
+        if lane == len(remaining):
+            next_lane.pop()
+            if schedule:
+                remaining[schedule.pop()] += 1
+            continue
+        next_lane[-1] += 1
+        if remaining[lane] == 0:
+            continue
+        remaining[lane] -= 1
+        schedule.append(lane)
+        if len(schedule) == total:
             yield tuple(schedule)
-            return
-        for lane, count in enumerate(remaining):
-            if count == 0:
-                continue
-            remaining[lane] -= 1
-            schedule.append(lane)
-            yield from visit()
-            schedule.pop()
-            remaining[lane] += 1
-
-    yield from visit()
+            remaining[schedule.pop()] += 1
+        else:
+            next_lane.append(0)
 
 
 def _read_schedules(path: Path) -> Iterator[tuple[int, tuple[int, ...]]]:
@@ -94,7 +100,7 @@ def _read_action_hex(env) -> str:
 def _run_schedule(env, schedule: Sequence[int], max_cycles: int) -> dict | None:
     """Run one lane schedule; return its result only if the image drains successfully."""
     env.reset()
-    action_hexes = []
+    actions = []
     cycle_count = 0
     terminated = truncated = False
     info = {}
@@ -103,7 +109,7 @@ def _run_schedule(env, schedule: Sequence[int], max_cycles: int) -> dict | None:
         nonlocal cycle_count, terminated, truncated, info
         _, _, terminated, truncated, info = env.step(action)
         cycle_count += 1
-        action_hexes.append(_read_action_hex(env))
+        actions.append({"cycle": cycle_count, "action_hex": _read_action_hex(env)})
 
     for lane in schedule:
         if terminated or truncated:
@@ -127,7 +133,7 @@ def _run_schedule(env, schedule: Sequence[int], max_cycles: int) -> dict | None:
 
     if info.get("deadlock") or truncated or not terminated:
         return None
-    return {"cycles": cycle_count, "action_hexes": action_hexes}
+    return {"cycles": cycle_count, "actions": actions}
 
 
 def run_brute_force(
