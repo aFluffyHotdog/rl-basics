@@ -40,7 +40,6 @@ def run_inference(
     image_dir: Path,
     sim_dir: Path,
     output_path: Path,
-    obs_version: str = "v3",
     max_cycles: int = 50000,
 ) -> dict:
     """Run one greedy episode and save each dispatched beat as a raw hex value."""
@@ -57,7 +56,6 @@ def run_inference(
         data_dir=str(beats_dir),
         sim_dir=str(sim_dir),
         is_inference=True,
-        obs_version=obs_version,
     )
     records = []
     try:
@@ -118,7 +116,6 @@ def main() -> None:
         default=Path("best_lane_beats.hex"),
         help="Output file for one raw action_hex value per cycle.",
     )
-    parser.add_argument("--obs-version", choices=("v1", "v2", "v3"), default="v3")
     parser.add_argument("--max-cycles", type=int, default=50000)
     args = parser.parse_args()
 
@@ -126,7 +123,6 @@ def main() -> None:
         image_dir=args.image_dir,
         sim_dir=args.sim_dir,
         output_path=args.output,
-        obs_version=args.obs_version,
         max_cycles=args.max_cycles,
     )
 

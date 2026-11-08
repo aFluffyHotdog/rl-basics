@@ -22,7 +22,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from envs.xsim.observation_v3 import build_observation_space_v3
-from envs.xsim.observation_v4 import build_observation_space_v4
 from training.bc_common import (
     SpaceOnlyEnv,
     batch_to_tensors,
@@ -33,15 +32,14 @@ from training.bc_common import (
 )
 from training.train_xsim import build_model
 
-OBS_SPACES = {"v3": build_observation_space_v3, "v4": build_observation_space_v4}
 TARGET_MATCH = 0.99
 PLATEAU_MATCH = 0.95
 
 
-def build_bc_model(obs_version: str):
+def build_bc_model():
     """A training-identical MaskablePPO on an env that only carries the spaces (no xsim)."""
-    space = OBS_SPACES[obs_version]()
-    return build_model(DummyVecEnv([lambda: SpaceOnlyEnv(space)]), obs_version)
+    space = build_observation_space_v3()
+    return build_model(DummyVecEnv([lambda: SpaceOnlyEnv(space)]))
 
 
 def bc_epoch(policy, optimizer, data: dict, idx: np.ndarray, batch_size: int, rng,
@@ -95,11 +93,10 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     data = load_teacher_data(args.data)
     data["value_targets"] = data.get("returns_norm", data["returns"]) if args.fit_value else None
-    obs_version = str(data["obs_version"])
     train_idx, val_idx = split_by_episode(data["episode_id"], args.holdout, args.seed)
-    print(f"{len(train_idx)} train / {len(val_idx)} held-out steps, obs {obs_version}")
+    print(f"{len(train_idx)} train / {len(val_idx)} held-out steps")
 
-    model = build_bc_model(obs_version)
+    model = build_bc_model()
     policy = model.policy
     optimizer = th.optim.Adam(policy.parameters(), lr=args.lr)
     best, best_state, since_best = -1.0, None, 0
@@ -116,7 +113,7 @@ def main() -> None:
 
     if best < PLATEAU_MATCH:
         print(f"\n>>> BC plateaued at {100 * best:.2f}% held-out match (< {100 * PLATEAU_MATCH:.0f}%). The observation "
-              f"probably lacks the teacher's state (cycles_since_fed_i / rr_distance, obs v4) -- not saving.")
+              f"probably lacks the teacher's scheduling state -- not saving.")
         sys.exit(1)
 
     policy.load_state_dict(best_state)

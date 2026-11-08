@@ -43,7 +43,9 @@ def plan_beat(queue, sub_decoder: dict, inflight: int) -> tuple[int, int, int]:
     # keep adding a cmd till the bus is full (only calculates, does not interact with the bus)
     while pos < len(queue) and slots < BEATS_ON_BUS:
         _, needed = decode_token_slots(queue[pos])
-        # TODO: this is sus, check what the test bench will do
+        # Stop when the next whole command group would overflow the beat. Matches the v20 testbench
+        # packer (blk_packer_v17 / deployment/testbench_but_python.py TestbenchPacker._pack): it is
+        # order-preserving and breaks on the first group that does not fit, never skipping ahead.
         if slots + needed > BEATS_ON_BUS:
             break
         # if the amount of slots needed is actually more than how much data there are, something's gone wrong buddy

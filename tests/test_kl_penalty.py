@@ -5,7 +5,7 @@ from stable_baselines3.common.logger import Logger
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from envs.xsim.constants import NUM_ACTIONS
-from envs.xsim.observation_v4 import build_observation_space_v4
+from envs.xsim.observation_v3 import build_observation_space_v3
 from training.bc_common import (
     SpaceOnlyEnv,
     ent_coef_at,
@@ -64,9 +64,9 @@ def test_entropy_schedule():
 
 def test_kl_ppo_trains_and_logs_kl(tmp_path):
     th.manual_seed(0)
-    venv = DummyVecEnv([lambda: SpaceOnlyEnv(build_observation_space_v4())])
+    venv = DummyVecEnv([lambda: SpaceOnlyEnv(build_observation_space_v3())])
     model = KLMaskablePPO("MultiInputPolicy", venv, n_steps=64, batch_size=32, n_epochs=2,
-                          policy_kwargs=build_policy_kwargs("v4"), seed=0)
+                          policy_kwargs=build_policy_kwargs(), seed=0)
     clone_path = tmp_path / "clone.pt"
     th.save(model.policy.state_dict(), clone_path)
     model.set_kl_prior(str(clone_path), beta=0.1, decay_episodes=10)

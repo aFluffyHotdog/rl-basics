@@ -59,13 +59,13 @@ def resolve_data_dir(data_dir) -> tuple[str, bool]:
     return str(path), False
 
 
-def make_teacher_env(data_dir, sim_dir, obs_version: str = "v4"):
+def make_teacher_env(data_dir, sim_dir):
     """Bare DecoderEnvXSim with the testbench mask gate."""
     from envs.xsim.env import DecoderEnvXSim
 
     path, is_inference = resolve_data_dir(data_dir)
     return DecoderEnvXSim(data_dir=path, sim_dir=sim_dir, is_inference=is_inference,
-                          obs_version=obs_version, inflight_gate=TB_INFLIGHT_GATE)
+                          inflight_gate=TB_INFLIGHT_GATE)
 
 
 def run_teacher_episode(env, teacher: RoundRobinTeacher | None = None, options: dict | None = None) -> dict:
@@ -100,12 +100,11 @@ def main() -> None:
                         help="Sample folder, its beats_hex/ folder, or a pool of sample folders.")
     parser.add_argument("--sim-dir", required=True, help="Path to the XSim simulation directory.")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--obs-version", default="v4", choices=("v3", "v4"))
     parser.add_argument("--expected", type=float, default=None,
                         help="SV testbench makespan; exit non-zero if the mean differs by more than 1%%.")
     args = parser.parse_args()
 
-    env = make_teacher_env(args.data_dir, args.sim_dir, args.obs_version)
+    env = make_teacher_env(args.data_dir, args.sim_dir)
     try:
         makespans = evaluate_teacher(env, args.episodes)
     finally:

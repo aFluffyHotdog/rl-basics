@@ -9,7 +9,7 @@ Saved to <out-dir>/teacher_<timestamp>.npz:
   returns       undiscounted return-to-go of the raw env reward
   returns_norm  same, of the reward scaled by the final VecNormalize statistics (what PPO's value
                 head is trained on)
-  makespans / sample_names   one per episode;  obs_version / inflight_gate   collection settings
+  makespans / sample_names   one per episode;  inflight_gate   collection setting
 plus the VecNormalize statistics in teacher_<timestamp>_vecnormalize.pkl (pass it to bc_pretrain.py
 and to train_xsim.py --vecnorm-stats). Steps where no-op is the only eligible action are skipped.
 """
@@ -34,9 +34,9 @@ def return_to_go(rewards) -> np.ndarray:
     return np.cumsum(np.asarray(rewards, dtype=np.float64)[::-1])[::-1]
 
 
-def collect(data_dir, sim_dir, episodes: int, obs_version: str = "v4", out_dir="data", seed: int = 0) -> Path:
+def collect(data_dir, sim_dir, episodes: int, out_dir="data", seed: int = 0) -> Path:
     path, is_inference = resolve_data_dir(data_dir)
-    venv = make_vec_env(path, sim_dir, obs_version, inflight_gate=TB_INFLIGHT_GATE, is_inference=is_inference)
+    venv = make_vec_env(path, sim_dir, inflight_gate=TB_INFLIGHT_GATE, is_inference=is_inference)
     venv.seed(seed)
     teacher = RoundRobinTeacher()
 
@@ -91,7 +91,6 @@ def collect(data_dir, sim_dir, episodes: int, obs_version: str = "v4", out_dir="
             returns_norm=np.concatenate(returns_norm).astype(np.float32),
             makespans=np.asarray(makespans, dtype=np.int64),
             sample_names=np.asarray(sample_names),
-            obs_version=np.asarray(obs_version),
             inflight_gate=np.asarray(TB_INFLIGHT_GATE),
         )
         venv.save(f"{stem}_vecnormalize.pkl")
@@ -109,11 +108,10 @@ def main() -> None:
                         help="Sample folder, its beats_hex/ folder, or a pool of sample folders.")
     parser.add_argument("--sim-dir", required=True, help="Path to the XSim simulation directory.")
     parser.add_argument("--episodes", type=int, default=30)
-    parser.add_argument("--obs-version", default="v4", choices=("v3", "v4"))
     parser.add_argument("--out-dir", default="data")
     parser.add_argument("--seed", type=int, default=0, help="Sample selection seed for the dataset pool.")
     args = parser.parse_args()
-    collect(args.data_dir, args.sim_dir, args.episodes, args.obs_version, args.out_dir, args.seed)
+    collect(args.data_dir, args.sim_dir, args.episodes, args.out_dir, args.seed)
 
 
 if __name__ == "__main__":

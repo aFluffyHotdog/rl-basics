@@ -144,7 +144,6 @@ def run_brute_force(
     start_line: int = 1,
     max_cycles: int = 50000,
     max_schedules: int | None = None,
-    obs_version: str = "v3",
 ) -> dict | None:
     if start_line < 1:
         raise ValueError("start_line must be at least 1")
@@ -180,7 +179,6 @@ def run_brute_force(
         data_dir=str(beats_dir),
         sim_dir=str(sim_dir),
         is_inference=True,
-        obs_version=obs_version,
     )
     tried = 0
     try:
@@ -225,7 +223,6 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("brute_force_best.json"))
     parser.add_argument("--max-cycles", type=int, default=50000)
     parser.add_argument("--max-schedules", type=int, help="Stop after this many schedules (default: all).")
-    parser.add_argument("--obs-version", choices=("v1", "v2", "v3", "v4"), default="v3")
     args = parser.parse_args()
 
     run_brute_force(
@@ -236,7 +233,6 @@ def main() -> None:
         start_line=args.start_line,
         max_cycles=args.max_cycles,
         max_schedules=args.max_schedules,
-        obs_version=args.obs_version,
     )
 
 

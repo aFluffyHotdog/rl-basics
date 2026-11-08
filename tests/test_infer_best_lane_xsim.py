@@ -28,7 +28,7 @@ def test_run_inference_picks_most_packable_eligible_lane(tmp_path, monkeypatch):
     output_path = tmp_path / "out" / "generated.hex"
 
     class FakeEnv:
-        def __init__(self, data_dir, sim_dir, is_inference, obs_version):
+        def __init__(self, data_dir, sim_dir, is_inference):
             self.step_number = 0
             self.actions = []
             self.hw_state = {"step_number": 0}

@@ -19,8 +19,8 @@ from .constants import (
     NO_OP_REASONS,
     NUM_ACTIONS,
     NUM_DECODERS,
-    NUM_ROWS,
     SUB_DECODER_FIELDS,
+    THROUGHPUT_WINDOW,
     TB_VIOLATION_KEYS,
     VIVADO_VERBOSE,
 )
@@ -30,36 +30,27 @@ from .flow_control import (
     cmd_inflight,
     compute_action_mask,
     no_op_reason,
-    packable_slots_by_lane,
     plan_beat,
     tb_rr_advance,
 )
-from .observation import build_observation, build_observation_space
-from .observation_v2 import build_observation_space_v2, build_observation_v2
 from .observation_v3 import build_observation_space_v3, build_observation_v3
-from .observation_v4 import build_observation_space_v4, build_observation_v4
-from .protocol import encode_beat, pack_payload, parse_obs_line
+from .protocol import IDLE_ACTION, encode_beat, pack_payload, parse_obs_line
 from .reward import LowerBoundTracker
-from .reward_v2 import reward_v2
+from .reward_v3 import reward_v3
 from .sim_client import XSimClient
 
 
-OBS_VERSIONS = ("v1", "v2", "v3", "v4")
-
-
 class DecoderEnvXSim(gym.Env):
-    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False, obs_version: str = "v3",
+    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False,
                  inflight_gate: int | None = None):
-        """obs_version: "v4" = v3 + per-lane cycles_since_fed and testbench round-robin cursor
-        distance (observation_v4.py); "v3" = per-lane features with work in output rows
-        (observation_v3.py); "v2" = the same layout with work in estimated cycles; "v1" = token-level
-        lookahead. Older versions exist only to load models trained with them.
+        """Hardware-in-the-loop decoder scheduling env.
+
+        Each RL step is one real scheduling decision: after the chosen beat is sent, the env
+        auto-ticks the simulator with no-ops while top_in is not ready, so every observation the
+        agent sees is a ready decision point (the clock is decoupled from the RL step).
         inflight_gate: if set, the mask also blocks lanes with more CMDs in flight than this
         (TB_INFLIGHT_GATE = the v20 testbench packer's rule). None = CMD FIFO depth only."""
         super().__init__()
-        if obs_version not in OBS_VERSIONS:
-            raise ValueError(f"obs_version must be one of {OBS_VERSIONS}, got {obs_version!r}")
-        self.obs_version = obs_version
         self.inflight_gate = inflight_gate
         self.data_dir = Path(data_dir).resolve()
         self.sim_dir = Path(sim_dir).resolve()
@@ -69,10 +60,7 @@ class DecoderEnvXSim(gym.Env):
         # Action Space: 0-7 (Regular), 8 (Yield Bus / NO_OP)
         self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
         # Observation Space combining live hardware state and input lookahead
-        self.observation_space = {
-            "v4": build_observation_space_v4, "v3": build_observation_space_v3,
-            "v2": build_observation_space_v2, "v1": build_observation_space,
-        }[obs_version]()
+        self.observation_space = build_observation_space_v3()
 
         self.sim = XSimClient(self.run_dir, verbose=VIVADO_VERBOSE)
         self.lb = LowerBoundTracker()
@@ -101,12 +89,14 @@ class DecoderEnvXSim(gym.Env):
 
         self.cmds = [deque(list(queue)) for queue in selected_dataset]
         self._mask_cache = None
-        self.initial_tokens = sum(len(cmd) for cmd in self.cmds)
         self.cycles = 0
         self.stall_cycles = 0
-        # Testbench round-robin cursor and per-lane cycles since the last beat (observation v4).
+        # Testbench round-robin cursor and per-lane cycles since the last beat (teacher tracking).
         self.rr_cursor = 0
         self.cycles_since_fed = np.zeros(NUM_DECODERS, dtype=np.int64)
+        # Rolling window of complete rows produced per cycle -> windowed throughput signal.
+        self.throughput_window = deque(maxlen=THROUGHPUT_WINDOW)
+        self._prev_total_rows = 0
 
         if not self.sim.is_running:
             self.sim.start()
@@ -126,43 +116,46 @@ class DecoderEnvXSim(gym.Env):
         self.lb.build(self.cmds)
         self.lb_prev = self.lb.compute(self.hw_state)
         self.lb0 = max(self.lb_prev, 1)
+        self._prev_total_rows = self._total_rows_decoded()
 
+        # Start the episode at a real decision point: skip any leading not-ready cycles.
+        self._skip_until_ready()
         return self._get_obs(), {}
 
-    # TODO: make this automatically increment cycle and send no-ops when top_in is not ready
     def step(self, action):
-        self.cycles += 1
         action = int(action)
         # log_top_not_ready_fifo_state(self.top_not_ready_log_path, self.cycles, action, self.hw_state)
-
-        packable_slots = packable_slots_by_lane(self.hw_state, self.cmds, self.lb.n_sent, self.inflight_gate)
-        best_slots = max(packable_slots)
         in_ready = bool(self.hw_state.get("top_in_ready", 0))
         valid_bit, commands_packed, payload_128b, slots_used = self._pack_beat(action)
         self._mask_cache = None   # queues / n_sent changed
-        self._track_schedule(action if valid_bit else NO_OP_ACTION, in_ready)
 
         action_hex = encode_beat(action, commands_packed, payload_128b)
-        self.sim.write_action(f"{valid_bit} {action_hex}")
-        self._advance_sim()
+        deadlock = self._tick(f"{valid_bit} {action_hex}", action if valid_bit else NO_OP_ACTION,
+                              in_ready, slots_used)
 
         if VIVADO_VERBOSE:
             self._print_step_debug(action, commands_packed, slots_used, action_hex)
 
         # --- failure terminals (no shaping on these steps) ---
         self._check_hw_consistency(action, action_hex)
-
-        if self._update_stall(slots_used):
+        if deadlock:
             remaining_cmds = [len(q) for q in self.cmds]
             print(f"[Env] Deadlock detected: stall_cycles={self.stall_cycles}, remaining_cmds={remaining_cmds}")
             return self._fail(deadlock=True, slots_used=slots_used)
 
-        # --- completion ---
         terminated = self._is_drained()
+        # Decouple the clock from the RL step: tick no-ops until top_in is ready for the next
+        # decision, so the returned observation is always a ready decision point.
+        if not terminated and not self.hw_state.get("top_in_ready", 0):
+            deadlock = self._skip_until_ready()
+            if deadlock:
+                return self._fail(deadlock=True, slots_used=0)
+            terminated = self._is_drained()
+
         if terminated:
             self.completed_images += 1
 
-        reward = self._reward(action, slots_used, terminated, best_slots)
+        reward = self._reward()
         return self._get_obs(), reward, terminated, False, self._get_info(terminated, slots_used)
 
     def action_masks(self) -> np.ndarray:
@@ -188,6 +181,45 @@ class DecoderEnvXSim(gym.Env):
         """Let the sim run until its next pause, updating hw_state from every @OBS line."""
         self.sim.resume()
         self.sim.wait_for_obs(self._on_obs)
+
+    def _tick(self, action_str: str, sent_lane: int, in_ready: bool, slots_used: int) -> bool:
+        """Advance exactly one testbench cycle with action_str and update all per-cycle bookkeeping.
+
+        lb.compute() must run once per @OBS line to keep the free-run row counter exact, so it (and
+        the throughput window and the schedule / stall counters) lives here, not once per RL step.
+        Returns True if this cycle tripped the deadlock guard.
+        """
+        self.sim.write_action(action_str)
+        self._advance_sim()
+        self.cycles += 1
+
+        lb_new = self.lb.compute(self.hw_state)
+        if DEBUG_CHECKS:
+            assert lb_new <= self.lb_prev, f"lower bound increased: {self.lb_prev} -> {lb_new}"
+        self.lb_prev = lb_new
+
+        self._update_throughput()
+        self._track_schedule(sent_lane, in_ready)
+        return self._update_stall(slots_used)
+
+    def _skip_until_ready(self) -> bool:
+        """Tick no-ops while top_in is not ready, until a decision point, drain, or deadlock.
+
+        Returns True if the deadlock guard tripped during the skip."""
+        while not self.hw_state.get("top_in_ready", 0) and not self._is_drained():
+            self.no_op_reason_counts["top_in_not_ready"] += 1
+            if self._tick(IDLE_ACTION, NO_OP_ACTION, in_ready=False, slots_used=0):
+                return True
+        return False
+
+    def _total_rows_decoded(self) -> int:
+        return sum(self.lb.rows_decoded(i, self.hw_state) for i in range(NUM_DECODERS))
+
+    def _update_throughput(self):
+        """Push this cycle's count of newly completed rows (all lanes) into the rolling window."""
+        total = self._total_rows_decoded()
+        self.throughput_window.append(max(0, total - self._prev_total_rows))
+        self._prev_total_rows = total
 
     def _on_obs(self, line: str):
         self._mask_cache = None   # hardware state changed -> recompute mask / mask observation
@@ -304,38 +336,16 @@ class DecoderEnvXSim(gym.Env):
         return self._get_obs(), reward, True, False, info
 
     # ------------------------------------------------------------------ reward / obs / info
-    def _reward(
-        self,
-        action: int,
-        slots_used: int,
-        terminated: bool,
-        best_slots: int,
-    ) -> float:
-        """reward_v2 on the post-step state. lb.compute() runs exactly once per step here: it also
-        advances the per-lane row counter that reward_v2 and observation v3 read."""
-        lb_new = self.lb.compute(self.hw_state)
+    def _reward(self) -> float:
+        """reward_v3 on the post-step state: throughput (windowed rows) minus per-lane output stdev.
+
+        The per-lane row counter is advanced in _tick (once per cycle), so this just reads it."""
         rows = [self.lb.rows_decoded(i, self.hw_state) for i in range(NUM_DECODERS)]
-        if DEBUG_CHECKS:
-            assert lb_new <= self.lb_prev, f"lower bound increased: {self.lb_prev} -> {lb_new}"
-            # if terminated:
-            #     assert lb_new == 0, f"episode finished but lb={lb_new} (parts: {self.lb.lb_parts})"
-            #     assert rows == [NUM_ROWS] * NUM_DECODERS, f"drained but rows decoded per lane = {rows}"
-            #     if "cmd_popped" in self.hw_state:
-            #         assert self.hw_state["cmd_popped"] == self.lb.n_sent, (
-            #             f"drained but RTL pops {self.hw_state['cmd_popped']} != groups sent {self.lb.n_sent}")
-        self.lb_prev = lb_new
-        self.slots_used = slots_used
-        return reward_v2(rows, action, slots_used, best_slots)
+        return reward_v3(sum(self.throughput_window), rows)
 
     def _get_obs(self):
-        if self.obs_version == "v4":
-            return build_observation_v4(self.hw_state, self.cmds, self.lb, self.action_masks(),
-                                        self.cycles_since_fed, self.rr_cursor)
-        if self.obs_version == "v3":
-            return build_observation_v3(self.hw_state, self.cmds, self.lb, self.action_masks())
-        if self.obs_version == "v2":
-            return build_observation_v2(self.hw_state, self.cmds, self.lb, self.lb0, self.action_masks())
-        return build_observation(self.hw_state, self.cmds, self.initial_tokens, self.lb.n_sent, self.action_masks)
+        return build_observation_v3(self.hw_state, self.cmds, self.lb, self.action_masks(),
+                                    sum(self.throughput_window))
 
     def _get_info(self, terminated: bool, slots_used: int) -> dict:
         info = {

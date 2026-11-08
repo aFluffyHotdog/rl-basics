@@ -3,29 +3,28 @@ import pytest
 import torch as th
 
 from envs.xsim.constants import NO_OP_ACTION, NUM_ACTIONS, NUM_DECODERS
-from envs.xsim.observation_v4 import LANE_FEATURES
+from envs.xsim.observation_v3 import GLOBAL_FEATURES, LANE_FEATURES
 from training.bc_common import OBS_PREFIX, load_teacher_data, split_by_episode
 from training.bc_pretrain import bc_epoch, build_bc_model, match_rate
 
-RR = LANE_FEATURES.index("rr_distance")
+# A per-lane feature the synthetic teacher keys its choice on (any lane scalar works).
+SIGNAL = LANE_FEATURES.index("work_left")
 
 
 def _synthetic(n_episodes=2, steps=64, seed=0) -> dict:
-    """Teacher-like data: action = eligible lane with the smallest rr_distance."""
+    """Teacher-like data: action = eligible lane with the smallest SIGNAL feature."""
     rng = np.random.default_rng(seed)
     n = n_episodes * steps
     lanes = rng.random((n, NUM_DECODERS, len(LANE_FEATURES))).astype(np.float32)
-    globals_ = rng.random((n, 6)).astype(np.float32)
+    globals_ = rng.random((n, len(GLOBAL_FEATURES))).astype(np.float32)
     masks = np.zeros((n, NUM_ACTIONS), dtype=bool)
     actions = np.zeros(n, dtype=np.int64)
     for k in range(n):
-        cursor = rng.integers(0, NUM_DECODERS + 1)
-        lanes[k, :, RR] = ((np.arange(NUM_DECODERS) - cursor) % (NUM_DECODERS + 1)) / NUM_DECODERS
         eligible = rng.random(NUM_DECODERS) < 0.5
         eligible[rng.integers(0, NUM_DECODERS)] = True
         masks[k, :NUM_DECODERS] = eligible
         lane_ids = np.flatnonzero(eligible)
-        actions[k] = lane_ids[np.argmin(lanes[k, lane_ids, RR])]
+        actions[k] = lane_ids[np.argmin(lanes[k, lane_ids, SIGNAL])]
     return {
         "obs": {"lanes": lanes, "globals": globals_},
         "masks": masks,
@@ -37,7 +36,7 @@ def _synthetic(n_episodes=2, steps=64, seed=0) -> dict:
 
 def test_masked_actions_get_zero_probability():
     th.manual_seed(0)
-    policy = build_bc_model("v4").policy
+    policy = build_bc_model().policy
     data = _synthetic()
     obs = {k: th.as_tensor(v) for k, v in data["obs"].items()}
     masks = th.as_tensor(data["masks"])
@@ -49,7 +48,7 @@ def test_masked_actions_get_zero_probability():
 
 def test_two_episode_dataset_overfits_within_20_epochs():
     th.manual_seed(0)
-    policy = build_bc_model("v4").policy
+    policy = build_bc_model().policy
     data = _synthetic()
     idx = np.arange(len(data["actions"]))
     optimizer = th.optim.Adam(policy.parameters(), lr=1e-3)

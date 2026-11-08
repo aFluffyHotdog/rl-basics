@@ -1,4 +1,4 @@
-"""SB3 features extractor for the v2 per-lane observation (envs/xsim/observation_v2.py)."""
+"""SB3 features extractor for the per-lane observation (envs/xsim/observation_v3.py)."""
 import gymnasium as gym
 import torch as th
 from torch import nn
