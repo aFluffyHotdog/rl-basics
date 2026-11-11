@@ -19,6 +19,8 @@ from .constants import (
     NO_OP_REASONS,
     NUM_ACTIONS,
     NUM_DECODERS,
+    REWARD_ALPHA,
+    REWARD_SCALE,
     SUB_DECODER_FIELDS,
     THROUGHPUT_WINDOW,
     TB_VIOLATION_KEYS,
@@ -36,7 +38,7 @@ from .flow_control import (
 from .observation_v3 import build_observation_space_v3, build_observation_v3
 from .protocol import IDLE_ACTION, encode_beat, pack_payload, parse_obs_line
 from .reward import LowerBoundTracker
-from .reward_v3 import reward_v3
+from .reward_v4 import reward_v4
 from .sim_client import XSimClient
 
 
@@ -117,6 +119,12 @@ class DecoderEnvXSim(gym.Env):
         self.lb_prev = self.lb.compute(self.hw_state)
         self.lb0 = max(self.lb_prev, 1)
         self._prev_total_rows = self._total_rows_decoded()
+        # Reward v4 baselines: the first step is charged for every cycle since reset (leading
+        # not-ready skips included), so the episode's summed reward is exactly -makespan / REWARD_SCALE.
+        self._last_step_cycles = 0
+        self._last_step_rows = self._prev_total_rows
+        self._last_cycles_elapsed = 0
+        self.episode_reward_sum = 0.0
 
         # Start the episode at a real decision point: skip any leading not-ready cycles.
         self._skip_until_ready()
@@ -156,6 +164,10 @@ class DecoderEnvXSim(gym.Env):
             self.completed_images += 1
 
         reward = self._reward()
+        if terminated and REWARD_ALPHA == 0.0:
+            expected = -self.cycles / REWARD_SCALE
+            assert abs(self.episode_reward_sum - expected) < 1e-6, (
+                f"episode reward {self.episode_reward_sum} != -makespan/REWARD_SCALE {expected}")
         return self._get_obs(), reward, terminated, False, self._get_info(terminated, slots_used)
 
     def action_masks(self) -> np.ndarray:
@@ -324,7 +336,7 @@ class DecoderEnvXSim(gym.Env):
         """Failure terminal. Each step costs LAMBDA_T, so crashing would otherwise be cheaper than
         the >= lb_now cycles still needed: charge those plus FAIL_PENALTY episodes' worth."""
         lb_now = self.lb.compute(self.hw_state)
-        reward = -(FAIL_PENALTY * self.lb0 + lb_now) * LAMBDA_T
+        reward = -(FAIL_PENALTY * self.lb0 + lb_now) * LAMBDA_T / REWARD_SCALE
         info = {
             "deadlock": deadlock,
             "mismatch": mismatch,
@@ -337,11 +349,17 @@ class DecoderEnvXSim(gym.Env):
 
     # ------------------------------------------------------------------ reward / obs / info
     def _reward(self) -> float:
-        """reward_v3 on the post-step state: throughput (windowed rows) minus per-lane output stdev.
+        """reward_v4: -cycles since the previous env step (incl. skipped cycles) + alpha * new rows.
 
-        The per-lane row counter is advanced in _tick (once per cycle), so this just reads it."""
-        rows = [self.lb.rows_decoded(i, self.hw_state) for i in range(NUM_DECODERS)]
-        return reward_v3(sum(self.throughput_window), rows)
+        The row counter is advanced in _tick (once per cycle), so this just reads it."""
+        cycles_elapsed = self.cycles - self._last_step_cycles
+        rows_done_delta = self._prev_total_rows - self._last_step_rows
+        self._last_step_cycles = self.cycles
+        self._last_step_rows = self._prev_total_rows
+        self._last_cycles_elapsed = cycles_elapsed
+        reward = reward_v4(cycles_elapsed, rows_done_delta, REWARD_ALPHA)
+        self.episode_reward_sum += reward
+        return reward
 
     def _get_obs(self):
         return build_observation_v3(self.hw_state, self.cmds, self.lb, self.action_masks(),
@@ -351,6 +369,7 @@ class DecoderEnvXSim(gym.Env):
         info = {
             "slots_used": slots_used,
             "cycle": self.cycles,
+            "cycles_elapsed": self._last_cycles_elapsed,   # clock cycles this env step advanced
             "sample_name": self.current_sample_name,
         }
         if not terminated:

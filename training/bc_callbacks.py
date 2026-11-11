@@ -2,7 +2,6 @@
 import numpy as np
 import torch as th
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize
 
 from envs.xsim.constants import NUM_DECODERS
 from envs.xsim.observation_v3 import GLOBAL_FEATURES
@@ -88,8 +87,7 @@ class TeacherMatchCallback(BaseCallback):
 class MakespanEvalCallback(BaseCallback):
     """Every `eval_every` training episodes (and once before training), run `n_episodes`
     deterministic episodes on fixed samples (sample_idx 0..n-1) and the teacher on the same samples
-    (cached). Logs eval/makespan and eval/makespan_vs_teacher; saves `best_path`.zip (plus its
-    VecNormalize stats) when the mean makespan improves.
+    (cached). Logs eval/makespan and eval/makespan_vs_teacher; saves `best_path`.zip () when the mean makespan improves. Selection uses raw makespan (cycles), never reward.
 
     Evaluation drives the bare env directly (no Monitor, so training stats are untouched) between
     rollouts, then resets the training env; the interrupted training episode is dropped.
@@ -116,11 +114,9 @@ class MakespanEvalCallback(BaseCallback):
             self.last_eval = self.episodes
             self._evaluate()
 
-    def _policy_episode(self, base, venv, sample_idx: int) -> dict:
+    def _policy_episode(self, base, sample_idx: int) -> dict:
         obs, _ = base.reset(options={"sample_idx": sample_idx})
         while True:
-            if isinstance(venv, VecNormalize) and venv.norm_obs:
-                obs = venv.normalize_obs(obs)
             action, _ = self.model.predict(obs, deterministic=True, action_masks=base.action_masks())
             obs, _, terminated, truncated, info = base.step(int(action))
             if terminated or truncated:
@@ -128,11 +124,10 @@ class MakespanEvalCallback(BaseCallback):
 
     def _evaluate(self):
         venv = self.model.get_env()
-        inner = venv.venv if isinstance(venv, VecNormalize) else venv
-        base = inner.envs[0].unwrapped
+        base = venv.envs[0].unwrapped
         makespans, ratios = [], []
         for k in range(self.n_episodes):
-            info = self._policy_episode(base, venv, k)
+            info = self._policy_episode(base, k)
             name = info.get("sample_name")
             if name not in self.teacher_makespan:
                 self.teacher_makespan[name] = run_teacher_episode(base, options={"sample_idx": k}).get("makespan")
@@ -149,8 +144,6 @@ class MakespanEvalCallback(BaseCallback):
         if mean < self.best:
             self.best = mean
             self.model.save(self.best_path)
-            if isinstance(venv, VecNormalize):
-                venv.save(f"{self.best_path}_vecnormalize.pkl")
             print(f"[eval] new best makespan {mean:.1f} -> {self.best_path}.zip")
 
         # Evaluation moved the env on; restart the training episode from a clean reset.

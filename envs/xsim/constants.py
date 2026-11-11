@@ -50,6 +50,10 @@ THROUGHPUT_WINDOW = 20          # cycles of history summed into the windowed thr
 THROUGHPUT_SCALE = THROUGHPUT_WINDOW * NUM_DECODERS   # max rows a window can close (1 row/lane/cycle)
 LAMBDA_THROUGHPUT = 1.0         # reward per complete row produced in the window
 LAMBDA_STDEV = 0.1              # penalty per row of output stdev across lanes
+# Reward v4 (reward_v4.py): r = -cycles_elapsed / REWARD_SCALE + REWARD_ALPHA * rows_done_delta (per env step)
+# With REWARD_ALPHA = 0 an episode's summed reward is exactly -makespan / REWARD_SCALE.
+REWARD_SCALE = 1000             # fixed divisor that puts the per-step cycle cost near O(1e-3..1e-2)
+REWARD_ALPHA = 0.0              # reward per complete row output since the previous env step
 # Terminal failure penalty (in lb0 units) for mismatch / deadlock; still charged per cycle.
 LAMBDA_T = 1
 DEBUG_CHECKS = False   # assert LB / CMD-accounting invariants every step; switch off for long runs

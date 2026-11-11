@@ -34,9 +34,12 @@ python training/collect_teacher.py --data-dir <pool or sample dir> --sim-dir <si
 
 This runs the teacher through the same wrapped env as PPO (with the TB gate and obs v4). It writes:
 
-- `data/teacher_<ts>.npz`: observations, masks, actions, episode ids, and return-to-go (raw and
-  VecNormalize-scaled).
-- `data/teacher_<ts>_vecnormalize.pkl`: the VecNormalize statistics.
+- `data/teacher_<ts>.npz`: observations, masks, actions, episode ids, and return-to-go of the env
+  reward (`-cycles / REWARD_SCALE`, the same scale as PPO's returns). It also stores `reward_scale`;
+  `bc_pretrain.py` refuses to fit the value head on data collected with a different scale.
+
+There is no VecNormalize: observations are hand-scaled to [0, 1] and the reward uses the fixed
+`REWARD_SCALE`, so no statistics are saved or loaded anywhere.
 
 Forced no-op steps are skipped. `--seed` sets the order in which samples are picked from the pool.
 
@@ -60,7 +63,6 @@ Other options: `--lr 3e-4`, `--batch-size 512`.
 
 ```
 python training/train_xsim.py --data-dir <pool> --sim-dir <sim dir> --obs_version v4 --tb-gate \
-    --vecnorm-stats data/teacher_<ts>_vecnormalize.pkl \
     --init-from models/bc_<ts>.zip --kl-prior models/bc_<ts>_clone.pt --kl-beta 0.1 --kl-decay-episodes 500 \
     --lr 3e-5 --ent-coef-schedule 0:0,100:0.001
 ```
@@ -68,10 +70,10 @@ python training/train_xsim.py --data-dir <pool> --sim-dir <sim dir> --obs_versio
 | flag | effect |
 |---|---|
 | `--tb-gate` | Testbench mask gate. Always pass it with a BC model: the BC model was trained on that mask. |
-| `--vecnorm-stats` | Start from the teacher run's VecNormalize statistics, so rewards are scaled as they were when the value head was fit. |
+| `--gae-lambda` | GAE lambda, allowed range 0.95-1.0 (default 0.98). |
 | `--init-from` | Copy the BC policy and value weights into the fresh model. The optimizer starts fresh. |
 | `--kl-prior`, `--kl-beta`, `--kl-decay-episodes` | Add `beta * KL(pi \|\| clone)` over the eligible actions to the PPO loss. Beta falls linearly to 0 over that many Monitor episodes. |
-| `--lr` | Constant learning rate. Without it, the rate decays linearly from 1e-4. |
+| `--lr` | Constant learning rate. Without it, the rate decays linearly from 3e-4 to a floor of 30% of that (never to 0). |
 | `--ent-coef-schedule` | Entropy coefficient by episode count, as `episode:value,...`. |
 | `--eval-every N`, `--eval-episodes 2` | Makespan evaluation; see below. |
 
@@ -80,7 +82,7 @@ whenever `--init-from` or `--kl-prior` is given. Each evaluation does the follow
 
 - runs `--eval-episodes` deterministic episodes on samples 0..n-1 of the pool;
 - runs the teacher on the same samples (cached after the first time);
-- saves `models/best.zip` (and `best_vecnormalize.pkl`) whenever the mean makespan improves.
+- saves `models/best.zip` whenever the mean makespan improves.
 
 Periodic checkpoints are kept as before. Without any of these flags, `train_xsim.py` behaves exactly
 as before.
@@ -93,6 +95,8 @@ as before.
 | `bc/beta` | Current KL weight. |
 | `bc/teacher_match_rate` | Share of rollout steps (with any lane eligible) where the policy's greedy action equals what the teacher would pick from the same state. That teacher follows the agent's actual actions. |
 | `bc/episodes`, `bc/ent_coef` | Episode count driving the schedules, and the current entropy coefficient. |
+| `rollout/makespan` | Mean raw makespan (cycles) of the episodes that finished in the rollout. The Monitor episode reward is `-makespan / REWARD_SCALE`; compare makespans, never rewards, and not with logs from older reward versions. |
+| `env/cycles_per_step_mean`, `env/cycles_per_step_max` | Clock cycles advanced per env step in the rollout; a large max means a long stall. |
 | `eval/makespan` | Mean deterministic makespan over the evaluation samples, in cycles. |
 | `eval/makespan_vs_teacher` | Mean of policy makespan / teacher makespan, per sample. 1.0 means teacher parity; below 1.0 means the policy beats the teacher. |
 

@@ -1,17 +1,15 @@
 """Roll the round-robin teacher through the PPO training env and save a behavior-cloning dataset.
 
-The env is the same wrapped stack train_xsim.py builds (ActionMasker -> Monitor -> DummyVecEnv ->
-VecNormalize) with the testbench mask gate on, so masks and observations match what PPO will see.
+The env is the same wrapped stack train_xsim.py builds (ActionMasker -> Monitor -> DummyVecEnv)
+with the testbench mask gate on, so masks, observations and rewards match what PPO will see.
 
 Saved to <out-dir>/teacher_<timestamp>.npz:
   obs__<key>    observations stacked per Dict key       masks        bool [N, 9]
   actions       int64 teacher actions                   episode_id   int64
-  returns       undiscounted return-to-go of the raw env reward
-  returns_norm  same, of the reward scaled by the final VecNormalize statistics (what PPO's value
-                head is trained on)
-  makespans / sample_names   one per episode;  inflight_gate   collection setting
-plus the VecNormalize statistics in teacher_<timestamp>_vecnormalize.pkl (pass it to bc_pretrain.py
-and to train_xsim.py --vecnorm-stats). Steps where no-op is the only eligible action are skipped.
+  returns       undiscounted return-to-go of the env reward (-cycles / reward_scale): the value-head
+                target, on the same scale as PPO's returns
+  makespans / sample_names   one per episode;  inflight_gate, reward_scale   collection settings
+Steps where no-op is the only eligible action are skipped.
 """
 import argparse
 import os
@@ -24,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sb3_contrib.common.maskable.utils import get_action_masks
 
-from envs.xsim.constants import NUM_DECODERS, TB_INFLIGHT_GATE
+from envs.xsim.constants import NUM_DECODERS, REWARD_SCALE, TB_INFLIGHT_GATE
 from policies.round_robin import RoundRobinTeacher, resolve_data_dir
 from training.bc_common import OBS_PREFIX
 from training.train_xsim import make_vec_env
@@ -58,13 +56,15 @@ def collect(data_dir, sim_dir, episodes: int, out_dir="data", seed: int = 0) -> 
                 episode_id.append(len(makespans))
                 ep_kept.append(len(ep_raw))
 
-            obs, _, dones, infos = venv.step(np.array([action]))
-            ep_raw.append(float(venv.get_original_reward()[0]))
+            obs, rewards, dones, infos = venv.step(np.array([action]))
+            ep_raw.append(float(rewards[0]))
             if dones[0]:
                 info = infos[0]
                 if "makespan" not in info:
                     raise RuntimeError(f"teacher episode {len(makespans)} failed: {info}")
                 makespans.append(int(info["makespan"]))
+                assert abs(sum(ep_raw) + makespans[-1] / REWARD_SCALE) < 1e-6, (
+                    f"episode reward {sum(ep_raw)} != -makespan/REWARD_SCALE")
                 sample_names.append(str(info.get("sample_name", "")))
                 raw_by_episode.append(ep_raw)
                 kept_by_episode.append(ep_kept)
@@ -73,10 +73,7 @@ def collect(data_dir, sim_dir, episodes: int, out_dir="data", seed: int = 0) -> 
                 ep_raw, ep_kept = [], []
                 teacher.reset()
 
-        returns, returns_norm = [], []
-        for raw, kept in zip(raw_by_episode, kept_by_episode):
-            returns.append(return_to_go(raw)[kept])
-            returns_norm.append(return_to_go(venv.normalize_reward(np.asarray(raw)))[kept])
+        returns = [return_to_go(raw)[kept] for raw, kept in zip(raw_by_episode, kept_by_episode)]
 
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,17 +85,16 @@ def collect(data_dir, sim_dir, episodes: int, out_dir="data", seed: int = 0) -> 
             actions=np.asarray(actions, dtype=np.int64),
             episode_id=np.asarray(episode_id, dtype=np.int64),
             returns=np.concatenate(returns).astype(np.float32),
-            returns_norm=np.concatenate(returns_norm).astype(np.float32),
             makespans=np.asarray(makespans, dtype=np.int64),
             sample_names=np.asarray(sample_names),
             inflight_gate=np.asarray(TB_INFLIGHT_GATE),
+            reward_scale=np.asarray(REWARD_SCALE),
         )
-        venv.save(f"{stem}_vecnormalize.pkl")
     finally:
         venv.close()
 
     print(f"\n>>> TEACHER MAKESPAN: mean = {np.mean(makespans):.1f} cycles over {len(makespans)} episodes")
-    print(f"Saved {len(actions)} steps to {stem}.npz (+ {stem.name}_vecnormalize.pkl)")
+    print(f"Saved {len(actions)} steps to {stem}.npz")
     return Path(f"{stem}.npz")
 
 

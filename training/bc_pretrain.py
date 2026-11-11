@@ -21,6 +21,7 @@ from torch.nn import functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from envs.xsim.constants import REWARD_SCALE
 from envs.xsim.observation_v3 import build_observation_space_v3
 from training.bc_common import (
     SpaceOnlyEnv,
@@ -81,7 +82,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--holdout", type=float, default=0.1, help="Fraction of episodes held out")
     parser.add_argument("--fit-value", action=argparse.BooleanOptionalAction, default=True,
-                        help="Also fit the value head to the (VecNormalize-scaled) return-to-go")
+                        help="Also fit the value head to the return-to-go (-cycles / REWARD_SCALE)")
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--patience", type=int, default=10,
                         help="Epochs without held-out improvement that count as a plateau")
@@ -92,7 +93,12 @@ def main() -> None:
     th.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     data = load_teacher_data(args.data)
-    data["value_targets"] = data.get("returns_norm", data["returns"]) if args.fit_value else None
+    if args.fit_value:
+        scale = data.get("reward_scale")
+        if scale is None or int(scale) != REWARD_SCALE:
+            sys.exit(f"{args.data} was collected with reward_scale={scale}, the env uses {REWARD_SCALE}: "
+                     "re-run collect_teacher.py (or pass --no-fit-value)")
+    data["value_targets"] = data["returns"] if args.fit_value else None
     train_idx, val_idx = split_by_episode(data["episode_id"], args.holdout, args.seed)
     print(f"{len(train_idx)} train / {len(val_idx)} held-out steps")
 
