@@ -43,20 +43,25 @@ from .sim_client import XSimClient
 
 
 class DecoderEnvXSim(gym.Env):
-    def __init__(self, data_dir: str, sim_dir: str, is_inference: bool = False,
-                 inflight_gate: int | None = None):
+    def __init__(self, data_dir: str, sim_dir: str | None = None, is_inference: bool = False,
+                 inflight_gate: int | None = None, backend: str = "xsim"):
         """Hardware-in-the-loop decoder scheduling env.
 
         Each RL step is one real scheduling decision: after the chosen beat is sent, the env
         auto-ticks the simulator with no-ops while top_in is not ready, so every observation the
         agent sees is a ready decision point (the clock is decoupled from the RL step).
         inflight_gate: if set, the mask also blocks lanes with more CMDs in flight than this
-        (TB_INFLIGHT_GATE = the v20 testbench packer's rule). None = CMD FIFO depth only."""
+        (TB_INFLIGHT_GATE = the v20 testbench packer's rule). None = CMD FIFO depth only.
+        backend: "xsim" (live Vivado, needs sim_dir) or "verilator" (in-process decomp_sim
+        extension, no sim_dir; an RTL assertion ends the episode as a failure)."""
         super().__init__()
+        if backend not in ("xsim", "verilator"):
+            raise ValueError(f"backend must be 'xsim' or 'verilator', got {backend!r}")
+        self.backend = backend
         self.inflight_gate = inflight_gate
         self.data_dir = Path(data_dir).resolve()
-        self.sim_dir = Path(sim_dir).resolve()
-        self.run_dir = self.sim_dir / "xsim_run" / "run"
+        self.sim_dir = Path(sim_dir).resolve() if sim_dir else None
+        self.run_dir = self.sim_dir / "xsim_run" / "run" if self.sim_dir else None
         self.dataset_pool = load_dataset_pool(self.data_dir, is_inference)
 
         # Action Space: 0-7 (Regular), 8 (Yield Bus / NO_OP)
@@ -64,7 +69,15 @@ class DecoderEnvXSim(gym.Env):
         # Observation Space combining live hardware state and input lookahead
         self.observation_space = build_observation_space_v3()
 
-        self.sim = XSimClient(self.run_dir, verbose=VIVADO_VERBOSE)
+        if backend == "verilator":
+            from .verilator_backend import load_verilator_module, make_verilator_client
+            self._rtl_stop = load_verilator_module().RtlStop
+            self.sim = make_verilator_client(verbose=VIVADO_VERBOSE)
+        else:
+            if self.run_dir is None:
+                raise ValueError("backend='xsim' needs sim_dir")
+            self._rtl_stop = ()   # `except ()` catches nothing
+            self.sim = XSimClient(self.run_dir, verbose=VIVADO_VERBOSE)
         self.lb = LowerBoundTracker()
         self.hw_state = {"top_in_ready": 1, "top_row_valid": 0, "mismatches": 0}
         # The action mask is needed twice per step (observation + MaskablePPO). It only depends on
@@ -131,6 +144,15 @@ class DecoderEnvXSim(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
+        # RtlStop = the RTL hit $stop / $fatal (an assertion on a malformed beat). Any simulated
+        # cycle can raise it (_tick and _skip_until_ready both advance the clock).
+        try:
+            return self._step(action)
+        except self._rtl_stop as e:
+            print(f"[Env] RTL stopped: {e}")
+            return self._fail(violation="rtl_stop", slots_used=0)
+
+    def _step(self, action):
         action = int(action)
         # log_top_not_ready_fifo_state(self.top_not_ready_log_path, self.cycles, action, self.hw_state)
         in_ready = bool(self.hw_state.get("top_in_ready", 0))

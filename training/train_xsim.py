@@ -42,18 +42,19 @@ def gae_lambda_arg(text: str) -> float:
         raise argparse.ArgumentTypeError(f"gae_lambda must be in {GAE_LAMBDA_RANGE}, got {value}")
     return value
 
-def make_vec_env(data_dir, sim_dir, inflight_gate=None, is_inference=False):
+def make_vec_env(data_dir, sim_dir=None, inflight_gate=None, is_inference=False, backend="xsim"):
     """The wrapped training env: ActionMasker -> Monitor -> DummyVecEnv.
 
     No VecNormalize: observations are hand-scaled to [0, 1] by the observation builder and the
     reward is scaled by the fixed REWARD_SCALE, so no running statistics exist to save or share.
     The Monitor episode reward is -makespan / REWARD_SCALE (not comparable with older reward versions).
     """
-    # WARNING: Do not vectorize multiple HW envs unless you duplicate the sim_dir
-    # to avoid Vivado file-lock collisions in xsim.dir!
+    # WARNING: Do not vectorize multiple xsim envs unless you duplicate the sim_dir
+    # to avoid Vivado file-lock collisions in xsim.dir! (The verilator backend is in-process and
+    # has no such limit.)
     def make_env():
         env = DecoderEnvXSim(data_dir=data_dir, sim_dir=sim_dir, is_inference=is_inference,
-                             inflight_gate=inflight_gate)
+                             inflight_gate=inflight_gate, backend=backend)
         env = ActionMasker(env, mask_fn)
         return Monitor(env)
 
@@ -210,7 +211,10 @@ class HwEpisodeStatsCallback(BaseCallback):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-dir', type=str, required=True, help="Path to dataset folder containing beats_hex")
-    ap.add_argument('--sim-dir', type=str, required=True, help="Path to the xsim simulation directory")
+    ap.add_argument('--backend', choices=['verilator', 'xsim'], default='verilator',
+                    help="Simulator behind the env: in-process Verilator (default) or live Vivado xsim")
+    ap.add_argument('--sim-dir', type=str, default=None,
+                    help="Path to the xsim simulation directory (only for --backend xsim)")
     ap.add_argument('--total_timesteps', type=int, default=10_000_000, help="Total training iterations")
     ap.add_argument('--save_freq', type=int, default=100_000, help="Save checkpoint every N steps")
     ap.add_argument('--resume_path', type=str, default=None, help="Path to checkpoint model to resume")
@@ -223,7 +227,7 @@ def main():
                     help="Frozen BC policy (*_clone.pt); adds beta * KL(pi || clone) to the PPO loss")
     ap.add_argument('--kl-beta', type=float, default=0.1)
     ap.add_argument('--kl-decay-episodes', type=int, default=500)
-    ap.add_argument('--lr', type=float, default=None, help="Constant learning rate (default: 3e-4 decaying to 30%)")
+    ap.add_argument('--lr', type=float, default=None, help="Constant learning rate (default: 3e-4 decaying to 30%%)")
     ap.add_argument('--gae-lambda', type=gae_lambda_arg, default=DEFAULT_GAE_LAMBDA,
                     help=f"GAE lambda, in [{GAE_LAMBDA_RANGE[0]}, {GAE_LAMBDA_RANGE[1]}] (default {DEFAULT_GAE_LAMBDA})")
     ap.add_argument('--ent-coef-schedule', type=str, default=None,
@@ -233,6 +237,8 @@ def main():
                          "(default 25 with --init-from / --kl-prior, else off)")
     ap.add_argument('--eval-episodes', type=int, default=2)
     args = ap.parse_args()
+    if args.backend == 'xsim' and not args.sim_dir:
+        ap.error("--backend xsim needs --sim-dir")
     warm_start = bool(args.init_from or args.kl_prior)
     eval_every = args.eval_every if args.eval_every is not None else (25 if warm_start else 0)
     if warm_start and not args.tb_gate:
@@ -251,9 +257,10 @@ def main():
     # --- 1. Single Hardware Environment Setup ---
     # WARNING: Do not vectorize multiple HW envs unless you duplicate the sim_dir 
     # to avoid Vivado file-lock collisions in xsim.dir!
-    print("Initializing Vivado Hardware-in-the-Loop Environment...")
+    print(f"Initializing {args.backend} Hardware-in-the-Loop Environment...")
     vec_env = make_vec_env(args.data_dir, args.sim_dir,
-                           inflight_gate=TB_INFLIGHT_GATE if args.tb_gate else None)
+                           inflight_gate=TB_INFLIGHT_GATE if args.tb_gate else None,
+                           backend=args.backend)
 
     # --- 2. Callbacks Setup ---
     stats_cb = HwEpisodeStatsCallback(log_file)
