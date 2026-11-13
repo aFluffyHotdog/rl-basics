@@ -1,0 +1,209 @@
+{
+  "meta": {
+    "backend": "verilator",
+    "gate": 8,
+    "data_dir": "/Users/tpattanasuttinont/Documents/GitHub/rl-basics/sample_data_9_lanes",
+    "num_rows": 720,
+    "definition": "bound = max(bus0, max_lane isolated_cycles); isolated = lane fed alone, densest beat whenever its mask bit is set, until all rows have left the lane"
+  },
+  "images": [
+    {
+      "image": "test_11_lantern",
+      "sample_idx": 0,
+      "isolated_cycles": [
+        1431,
+        1481,
+        1851,
+        2340,
+        2078,
+        1795,
+        1509,
+        1212
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 3,
+      "longest_isolated": 2340,
+      "bus0": 1738,
+      "static_lb0": 2173,
+      "bound": 2340,
+      "binding_term": "lane",
+      "rr_makespan": 2393,
+      "rr_gap": 53
+    },
+    {
+      "image": "test_12_tulip",
+      "sample_idx": 1,
+      "isolated_cycles": [
+        986,
+        964,
+        1605,
+        2147,
+        2156,
+        1579,
+        1416,
+        1072
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 4,
+      "longest_isolated": 2156,
+      "bus0": 984,
+      "static_lb0": 1942,
+      "bound": 2156,
+      "binding_term": "lane",
+      "rr_makespan": 2160,
+      "rr_gap": 4
+    },
+    {
+      "image": "test_13_number",
+      "sample_idx": 2,
+      "isolated_cycles": [
+        884,
+        880,
+        1009,
+        1503,
+        1111,
+        1019,
+        941,
+        770
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 3,
+      "longest_isolated": 1503,
+      "bus0": 420,
+      "static_lb0": 1037,
+      "bound": 1503,
+      "binding_term": "lane",
+      "rr_makespan": 1506,
+      "rr_gap": 3
+    },
+    {
+      "image": "test_14_items",
+      "sample_idx": 3,
+      "isolated_cycles": [
+        2677,
+        2339,
+        1859,
+        2310,
+        1922,
+        1976,
+        2221,
+        1755
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 0,
+      "longest_isolated": 2677,
+      "bus0": 2311,
+      "static_lb0": 2694,
+      "bound": 2677,
+      "binding_term": "lane",
+      "rr_makespan": 3087,
+      "rr_gap": 410
+    },
+    {
+      "image": "test_15_maple",
+      "sample_idx": 4,
+      "isolated_cycles": [
+        1253,
+        1669,
+        1971,
+        2158,
+        1772,
+        1661,
+        1900,
+        1220
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 3,
+      "longest_isolated": 2158,
+      "bus0": 1393,
+      "static_lb0": 1911,
+      "bound": 2158,
+      "binding_term": "lane",
+      "rr_makespan": 2165,
+      "rr_gap": 7
+    },
+    {
+      "image": "test_16_road",
+      "sample_idx": 5,
+      "isolated_cycles": [
+        2139,
+        2358,
+        2071,
+        1822,
+        2014,
+        1982,
+        2264,
+        2165
+      ],
+      "isolated_status": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "violations": {},
+      "longest_lane": 1,
+      "longest_isolated": 2358,
+      "bus0": 2367,
+      "static_lb0": 2367,
+      "bound": 2367,
+      "binding_term": "bus0",
+      "rr_makespan": 2642,
+      "rr_gap": 275
+    }
+  ]
+}

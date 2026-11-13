@@ -88,6 +88,7 @@ class DecoderEnvXSim(gym.Env):
         # The action mask is needed twice per step (observation + MaskablePPO). It only depends on
         # hw_state and the pending queues, so it is computed once per state and then reused.
         self._mask_cache = None
+        self._obs_batch = []   # parsed @OBS lines received since the last _tick (one per simulated clock)
         self.no_op_reason_counts = {reason: 0 for reason in NO_OP_REASONS}
         self.top_not_ready_log_path = Path("top_not_ready_fifo_states.json")
         self.completed_images = 0
@@ -235,9 +236,16 @@ class DecoderEnvXSim(gym.Env):
         the throughput window and the schedule / stall counters) lives here, not once per RL step.
         Returns True if this cycle tripped the deadlock guard.
         """
+        self._obs_batch = []
         self.sim.write_action(action_str)
         self._advance_sim()
-        self.cycles += 1
+        # One @OBS line = one simulated clock. xsim can run several clocks per pause (the sim skips
+        # timesteps itself), so count the lines actually received; verilator always gives exactly 1.
+        batch, self._obs_batch = self._obs_batch, []
+        self.cycles += max(1, len(batch))
+        # Replay the skipped clocks so lb's free-run row counter sees every cycle, then the final state.
+        for obs in batch[:-1]:
+            self.lb.compute({**self.hw_state, **obs})
 
         lb_new = self.lb.compute(self.hw_state)
         if DEBUG_CHECKS:
@@ -270,6 +278,7 @@ class DecoderEnvXSim(gym.Env):
     def _on_obs(self, line: str):
         self._mask_cache = None   # hardware state changed -> recompute mask / mask observation
         obs = parse_obs_line(line)
+        self._obs_batch.append(obs)
         self.hw_state.update(obs)
         for key in EXT_OBS_KEYS:   # older testbench: drop stale extended fields
             if key not in obs:
