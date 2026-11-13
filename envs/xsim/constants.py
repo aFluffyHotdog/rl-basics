@@ -54,6 +54,9 @@ LAMBDA_STDEV = 0.1              # penalty per row of output stdev across lanes
 # With REWARD_ALPHA = 0 an episode's summed reward is exactly -makespan / REWARD_SCALE.
 REWARD_SCALE = 1000             # fixed divisor that puts the per-step cycle cost near O(1e-3..1e-2)
 REWARD_ALPHA = 0.0              # reward per complete row output since the previous env step
+# Reward version used by DecoderEnvXSim: 5 = reward_v5.py (v4 cycle cost + potential on beats_left),
+# 4 = reward_v4.py (cycle cost, optional row bonus).
+REWARD_VERSION = 5
 # Terminal failure penalty (in lb0 units) for mismatch / deadlock; still charged per cycle.
 LAMBDA_T = 1
 DEBUG_CHECKS = False   # assert LB / CMD-accounting invariants every step; switch off for long runs

@@ -12,14 +12,15 @@ from .constants import (
     DEADLOCK_STALL_CYCLES,
     DEBUG_CHECKS,
     EXT_OBS_KEYS,
-    FAIL_ON_LANE_MISMATCH,
     FAIL_PENALTY,
     LAMBDA_T,
     NO_OP_ACTION,
     NO_OP_REASONS,
     NUM_ACTIONS,
     NUM_DECODERS,
+    NUM_ROWS,
     REWARD_ALPHA,
+    REWARD_VERSION,
     REWARD_SCALE,
     SUB_DECODER_FIELDS,
     THROUGHPUT_WINDOW,
@@ -39,12 +40,14 @@ from .observation_v3 import build_observation_space_v3, build_observation_v3
 from .protocol import IDLE_ACTION, encode_beat, pack_payload, parse_obs_line
 from .reward import LowerBoundTracker
 from .reward_v4 import reward_v4
+from .reward_v5 import reward_v5
 from .sim_client import XSimClient
 
 
 class DecoderEnvXSim(gym.Env):
     def __init__(self, data_dir: str, sim_dir: str | None = None, is_inference: bool = False,
-                 inflight_gate: int | None = None, backend: str = "xsim"):
+                 inflight_gate: int | None = None, backend: str = "xsim",
+                 log_rtl_stop: bool = True):
         """Hardware-in-the-loop decoder scheduling env.
 
         Each RL step is one real scheduling decision: after the chosen beat is sent, the env
@@ -53,11 +56,13 @@ class DecoderEnvXSim(gym.Env):
         inflight_gate: if set, the mask also blocks lanes with more CMDs in flight than this
         (TB_INFLIGHT_GATE = the v20 testbench packer's rule). None = CMD FIFO depth only.
         backend: "xsim" (live Vivado, needs sim_dir) or "verilator" (in-process decomp_sim
-        extension, no sim_dir; an RTL assertion ends the episode as a failure)."""
+        extension, no sim_dir; an RTL assertion ends the episode as a failure).
+        log_rtl_stop: print a line when the RTL stops (False for searches that expect many stops)."""
         super().__init__()
         if backend not in ("xsim", "verilator"):
             raise ValueError(f"backend must be 'xsim' or 'verilator', got {backend!r}")
         self.backend = backend
+        self.log_rtl_stop = log_rtl_stop
         self.inflight_gate = inflight_gate
         self.data_dir = Path(data_dir).resolve()
         self.sim_dir = Path(sim_dir).resolve() if sim_dir else None
@@ -133,11 +138,12 @@ class DecoderEnvXSim(gym.Env):
         self.lb0 = max(self.lb_prev, 1)
         self._prev_total_rows = self._total_rows_decoded()
         # Reward v4 baselines: the first step is charged for every cycle since reset (leading
-        # not-ready skips included), so the episode's summed reward is exactly -makespan / REWARD_SCALE.
+        # not-ready skips included), so the cycle part of the episode's summed reward is exactly -makespan / REWARD_SCALE.
         self._last_step_cycles = 0
         self._last_step_rows = self._prev_total_rows
         self._last_cycles_elapsed = 0
         self.episode_reward_sum = 0.0
+        self._beats_left0 = self._prev_beats_left = self._beats_left_total()   # reward v5 potential
 
         # Start the episode at a real decision point: skip any leading not-ready cycles.
         self._skip_until_ready()
@@ -149,7 +155,8 @@ class DecoderEnvXSim(gym.Env):
         try:
             return self._step(action)
         except self._rtl_stop as e:
-            print(f"[Env] RTL stopped: {e}")
+            if self.log_rtl_stop:
+                print(f"[Env] RTL stopped: {e}")
             return self._fail(violation="rtl_stop", slots_used=0)
 
     def _step(self, action):
@@ -186,7 +193,12 @@ class DecoderEnvXSim(gym.Env):
             self.completed_images += 1
 
         reward = self._reward()
-        if terminated and REWARD_ALPHA == 0.0:
+        if terminated and REWARD_VERSION == 5:
+            # Shaping telescopes: sum r = (B_left(s_0) - B_left(s_end) - makespan) / REWARD_SCALE
+            expected = (self._beats_left0 - self._prev_beats_left - self.cycles) / REWARD_SCALE
+            assert abs(self.episode_reward_sum - expected) < 1e-6, (
+                f"episode reward {self.episode_reward_sum} != (B0 - B_end - makespan)/REWARD_SCALE {expected}")
+        elif terminated and REWARD_VERSION == 4 and REWARD_ALPHA == 0.0:
             expected = -self.cycles / REWARD_SCALE
             assert abs(self.episode_reward_sum - expected) < 1e-6, (
                 f"episode reward {self.episode_reward_sum} != -makespan/REWARD_SCALE {expected}")
@@ -308,6 +320,10 @@ class DecoderEnvXSim(gym.Env):
         """Testbench counter change since reset (the sim restarts, but don't rely on it)."""
         return self.hw_state.get(key, 0) - self._chk_base.get(key, 0)
 
+    def _pin_skew_mismatches(self) -> int:
+        """Skew-aware output-pin mismatches (verilator backend only; 0 on xsim)."""
+        return int(self.sim.sim.pin_skew_mismatches) if self.backend == "verilator" and self.sim.sim else 0
+
     def _check_tb_counters(self):
         """Return the name of the first testbench violation counter that has increased, else None."""
         for key in TB_VIOLATION_KEYS:
@@ -330,9 +346,17 @@ class DecoderEnvXSim(gym.Env):
                     f"lane {i}: RTL popped {self.hw_state['cmd_popped'][i]} CMDs but only "
                     f"{self.lb.n_sent[i]} groups were sent -- group != CMD-FIFO entry, check the unit")
 
-        if self.hw_state["mismatches"] > 0 or (FAIL_ON_LANE_MISMATCH and self._delta("lane_mismatches") > 0):
-            print(f"[Env] Hardware Mismatch Detected! Total Mismatches: {self.hw_state['mismatches']}, "
-                  f"lane mismatches since reset: {self._delta('lane_mismatches')}")
+        # The testbench's output-pin counter ("mismatches") compares every lane with reference row k
+        # on the k-th pin pulse, but the free-run wrapper lets lanes drift apart, so it fires on a
+        # correct decode. Use the per-lane golden check instead; on the verilator backend also the
+        # skew-aware pin check. Only an old testbench without lane_mismatches falls back to it.
+        if "lane_mismatches" in self.hw_state:
+            bad = self._delta("lane_mismatches") > 0 or self._pin_skew_mismatches() > 0
+        else:
+            bad = self.hw_state["mismatches"] > 0
+        if bad:
+            print(f"[Env] Hardware Mismatch Detected! lane mismatches since reset: "
+                  f"{self._delta('lane_mismatches')}, skew-aware pin mismatches: {self._pin_skew_mismatches()}")
             print(f"[Env] action_hex: {action_hex}")
 
     def _update_stall(self, slots_used: int) -> bool:
@@ -344,8 +368,16 @@ class DecoderEnvXSim(gym.Env):
         return self.stall_cycles > DEADLOCK_STALL_CYCLES
 
     def _is_drained(self) -> bool:
-        """All queues sent and every subdecoder FIFO / output row empty."""
+        """All queues sent, every subdecoder FIFO / output row empty, and every lane has output all
+        of its rows.
+
+        Empty FIFOs alone are not enough: an executor can still be producing rows from a command it
+        has already popped (e.g. a run of repeated rows), which no FIFO counter shows. Without the
+        row check the episode ended up to ~12 cycles early. rows_consumed is the testbench's
+        slowest-lane row count; an older testbench without it falls back to the FIFO check."""
         if sum(len(q) for q in self.cmds) != 0:
+            return False
+        if "rows_consumed" in self.hw_state and self.hw_state["rows_consumed"] < NUM_ROWS:
             return False
         sub_decoders = self.hw_state.get("sub_decoders", [])
         return (
@@ -370,8 +402,14 @@ class DecoderEnvXSim(gym.Env):
         return self._get_obs(), reward, True, False, info
 
     # ------------------------------------------------------------------ reward / obs / info
+    def _beats_left_total(self) -> int:
+        """B_left(s): dense beats still needed to send what is left, summed over lanes."""
+        return sum(self.lb.beats_left(i) for i in range(NUM_DECODERS))
+
     def _reward(self) -> float:
-        """reward_v4: -cycles since the previous env step (incl. skipped cycles) + alpha * new rows.
+        """Reward v5 (default): -cycles since the previous env step (incl. skipped cycles) plus the
+        drop in B_left over the step, all / REWARD_SCALE. REWARD_VERSION = 4 gives the old reward
+        (-cycles + alpha * new rows).
 
         The row counter is advanced in _tick (once per cycle), so this just reads it."""
         cycles_elapsed = self.cycles - self._last_step_cycles
@@ -379,7 +417,12 @@ class DecoderEnvXSim(gym.Env):
         self._last_step_cycles = self.cycles
         self._last_step_rows = self._prev_total_rows
         self._last_cycles_elapsed = cycles_elapsed
-        reward = reward_v4(cycles_elapsed, rows_done_delta, REWARD_ALPHA)
+        beats_now = self._beats_left_total()
+        if REWARD_VERSION == 5:
+            reward = reward_v5(cycles_elapsed, self._prev_beats_left, beats_now)
+        else:
+            reward = reward_v4(cycles_elapsed, rows_done_delta, REWARD_ALPHA)
+        self._prev_beats_left = beats_now
         self.episode_reward_sum += reward
         return reward
 

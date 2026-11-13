@@ -47,7 +47,8 @@ def make_vec_env(data_dir, sim_dir=None, inflight_gate=None, is_inference=False,
 
     No VecNormalize: observations are hand-scaled to [0, 1] by the observation builder and the
     reward is scaled by the fixed REWARD_SCALE, so no running statistics exist to save or share.
-    The Monitor episode reward is -makespan / REWARD_SCALE (not comparable with older reward versions).
+    The Monitor episode reward is (B_left(s_0) - makespan) / REWARD_SCALE with reward v5 (B_left = dense beats
+    needed for the image; not comparable with older reward versions).
     """
     # WARNING: Do not vectorize multiple xsim envs unless you duplicate the sim_dir
     # to avoid Vivado file-lock collisions in xsim.dir! (The verilator backend is in-process and

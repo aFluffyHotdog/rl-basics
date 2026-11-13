@@ -19,7 +19,8 @@ def load_hex_folder(cmd_path: Path) -> list:
 
 def _stem_path(hex_dir: Path) -> Path:
     first_file = next(hex_dir.glob('*.hex')).name
-    return hex_dir / first_file.split('_subdec')[0]
+    # rsplit: an image name can itself contain "_subdec" (test_40_subdec_cols_subdec0_beats.hex)
+    return hex_dir / first_file.rsplit('_subdec', 1)[0]
 
 
 def load_dataset_pool(data_dir: Path, is_inference: bool = False) -> list:

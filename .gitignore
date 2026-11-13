@@ -20,3 +20,4 @@ ENV/
 sample_data/
 hexes_plots/
 data/
+verilator_harness/
