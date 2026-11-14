@@ -18,7 +18,7 @@ OUT_FIFO_SIZE = 4
 NUM_ROWS = 720
 ROW_BYTES = 16
 
-DEADLOCK_STALL_CYCLES = 500
+DEADLOCK_STALL_CYCLES = 3000
 
 # v20 testbench packer (blk_packer_v17), used by the round-robin teacher and the opt-in mask gate.
 TB_INFLIGHT_GATE = 8                  # TB only feeds a lane with <= 8 CMDs in flight (committed - popped)
